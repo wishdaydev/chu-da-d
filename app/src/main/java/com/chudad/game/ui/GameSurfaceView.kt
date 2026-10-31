@@ -81,7 +81,7 @@ class GameSurfaceView(context: Context) : SurfaceView(context), SurfaceHolder.Ca
     private var topBarH = 84f
     /** AI 信息面板尺寸（随 uiScale 缩放，与牌背统一） */
     private var aiPanelW = 320f
-    private var aiPanelH = 180f
+    private var aiPanelH = 130f
 
     private fun recalcSizes() {
         // 双维自适应：取「宽归一化比」与「高归一化比」的较小值，避免任一维度溢出；
@@ -107,7 +107,9 @@ class GameSurfaceView(context: Context) : SurfaceView(context), SurfaceHolder.Ca
         aiBackH = (98f * scale).coerceAtLeast(70f)
         // AI 信息面板尺寸随 uiScale 缩放（与牌背/手牌统一），让 Pad 上面板不再偏小
         aiPanelW = 320f * scale
-        val newPanelH = 180f * scale
+        // 面板高度从 180 收窄到 130：原顶部「地主/农民」角色行在锄大D 已无意义，
+        // 去掉该空行后牌数/名称上提，牌背与信息框整体随之上移
+        val newPanelH = 130f * scale
         // 面板玻璃底渐变仅在面板高度变化时重建（原先每帧 ×2 new LinearGradient，动画/思考期有 GC 压力）
         if (aiPanelH != newPanelH) {
             aiPanelH = newPanelH
@@ -1639,16 +1641,16 @@ class GameSurfaceView(context: Context) : SurfaceView(context), SurfaceHolder.Ca
         scratchRect.set(panelX, topY, panelX + panelW, topY + panelH)
         canvas.drawRoundRect(scratchRect, 18f, 18f, cardBorderPaint)
 
-        // 锄大D 四人各自为战：面板首行直接显示剩余张数
+        // 锄大D 四人各自为战：面板首行直接显示剩余张数（原「地主/农民」角色行已移除，故上提贴近面板顶）
         // 剩余张数（放大2.5倍: 30*2.5=75 -> 用50f）
         textPaint.textSize = 46f * uiScale
         textPaint.color = Palette.gold
-        canvas.drawText("${player.cardCount}张", centerX, topY + 100f * uiScale, textPaint)
+        canvas.drawText("${player.cardCount}张", centerX, topY + 54f * uiScale, textPaint)
 
         // 玩家名称（你/电脑A/电脑B/电脑C），颜色灰白色
         textPaint.textSize = 38f * uiScale
         textPaint.color = Palette.textLightGray
-        canvas.drawText(player.name, centerX, topY + 155f * uiScale, textPaint)
+        canvas.drawText(player.name, centerX, topY + 108f * uiScale, textPaint)
 
         // 牌背扇形（放大2倍）：结算/结束时由正面剩余牌占据该位置，不再画牌背
         if (sm.phase != GamePhase.SETTLING && sm.phase != GamePhase.GAME_OVER) {
@@ -1751,9 +1753,9 @@ class GameSurfaceView(context: Context) : SurfaceView(context), SurfaceHolder.Ca
      */
     private fun tableSlotCenter(slot: Int): Pair<Float, Float> = when (slot) {
         0 -> (screenWidth * 0.50f) to (screenHeight * 0.59f)   // 你（底部）
-        1 -> (screenWidth * 0.78f) to (screenHeight * 0.42f)   // 电脑A（右）
-        2 -> (screenWidth * 0.22f) to (screenHeight * 0.42f)   // 电脑B（左）
-        else -> (screenWidth * 0.50f) to (screenHeight * 0.36f)// 电脑C（上中）
+        1 -> (screenWidth * 0.78f) to (screenHeight * 0.40f)   // 电脑A（右）
+        2 -> (screenWidth * 0.22f) to (screenHeight * 0.40f)   // 电脑B（左）
+        else -> (screenWidth * 0.50f) to (screenHeight * 0.34f)// 电脑C（上中）
     }
 
     /** 桌面中央展示当前最新一手出牌（4 个槽位，各槽位附近标注出牌者名字） */
@@ -2173,7 +2175,7 @@ class GameSurfaceView(context: Context) : SurfaceView(context), SurfaceHolder.Ca
     /** 某 AI 玩家信息区真实包围盒（信息面板 + 牌背扇形 + 可能的「不出」气泡），
      *  用于让「轮到出牌」高亮框精确包住并略大于该信息区域。
      *  坐标与 drawAIPlayer 严格一致（统一取自 aiSlotCenter）：电脑A 右侧、电脑B 左侧、
-     *  电脑C 顶部中间，顶 y=100f；面板固定 320x180；牌背宽随 uiScale(aiBackW/aiBackH) 变化，故框也随之缩放。 */
+     *  电脑C 顶部中间，顶 y=100f；面板固定 320x130；牌背宽随 uiScale(aiBackW/aiBackH) 变化，故框也随之缩放。 */
     private fun aiInfoBounds(playerIndex: Int): RectF {
         val (centerX, topY) = aiSlotCenter(playerIndex)
         val panelW = aiPanelW

@@ -57,11 +57,32 @@ fun main(args: Array<String>) {
     val proxyMode = System.getenv("PROXY_MODE") ?: "heuristic"
     val proxyDeadlineMs = System.getenv("PROXY_DEADLINE_MS")?.toLongOrNull() ?: 3L
 
+    // 哪些座位用启发式出牌（其余用大师搜索）。
+    // 未显式指定 HEURISTIC_SEATS 时退回旧语义：HUMAN_MODEL_SEAT 指定的座位即为唯一启发式座位。
+    val heuristicSeats: Set<Int> =
+        System.getenv("HEURISTIC_SEATS")?.split(',')
+            ?.mapNotNull { it.trim().toIntOrNull() }?.filter { it in 0..3 }?.toSet()
+            ?: if (humanSeat in 0..3) setOf(humanSeat) else emptySet()
+
+    // 大师搜索的对手模型：selfish（默认，与线上一致：各家各自最优）｜paranoid（旧行为：三家联盟 MIN）
+    val oppModelName = System.getenv("OPP_MODEL") ?: "selfish"
+    val oppModel = if (oppModelName == "selfish") 1 else 0
+    val oppTopK = System.getenv("OPP_TOPK")?.toIntOrNull() ?: 2
+    // 迭代加深深度上限：不设＝MasterSearch 线上默认（64，实质由时间截断）；
+    // 压到 8~12 可做「浅搜索」对照，验证深度对结论的影响
+    val maxDepth = System.getenv("MAX_DEPTH")?.toIntOrNull()
+    // 按座位指定谁用 selfish：用于「混合对局」量化模型优势（不设则 OPP_MODEL 全局生效）
+    val selfishSeats: Set<Int> = System.getenv("SELFISH_SEATS")?.split(',')
+        ?.mapNotNull { it.trim().toIntOrNull() }?.filter { it in 0..3 }?.toSet()
+        ?: if (oppModel == 1) setOf(0, 1, 2, 3) else emptySet()
+
     println(
         "锄大D 4人仿真: games=$games deadline=${deadlineMs}ms " +
             "nodeLimit=$nodeLimit threads=$threads baseSeed=$baseSeed " +
             "CTRL_W=$ctrlW CTRL_W_BASE=$ctrlWBase TREAT_SEATS=$treatSeats " +
             "HUMAN_MODEL_SEAT=$humanSeat HUMAN_MODEL_WEIGHT=$humanWeight " +
+            "HEURISTIC_SEATS=$heuristicSeats SELFISH_SEATS=$selfishSeats K=$oppTopK " +
+            "MAX_DEPTH=${maxDepth ?: 64} " +
             "PROXY_MODE=$proxyMode PROXY_DEADLINE=${proxyDeadlineMs}ms"
     )
 
@@ -78,7 +99,7 @@ fun main(args: Array<String>) {
         try {
             val r = playGame(
                 seed, deadlineMs, nodeLimit, ctrlW, ctrlWBase, treatSeats, humanSeat, humanWeight,
-                proxyMode, proxyDeadlineMs
+                heuristicSeats, oppTopK, selfishSeats, proxyMode, proxyDeadlineMs, maxDepth
             )
             synchronized(wins) { if (r.winner in 0..3) wins[r.winner]++ }
             totalMoves.addAndGet(r.moves.toLong())
@@ -154,8 +175,12 @@ private fun playGame(
     treatSeats: Set<Int>,
     humanSeat: Int,
     humanWeight: Double,
+    heuristicSeats: Set<Int>,
+    oppTopK: Int,
+    selfishSeats: Set<Int>,
     proxyMode: String,
-    proxyDeadlineMs: Long
+    proxyDeadlineMs: Long,
+    maxDepth: Int?
 ): GameResult {
     val hands = deal(seed)
     // 真实开局：持 ♦3 者先出，且首手必须含 ♦3。
@@ -179,7 +204,7 @@ private fun playGame(
         val mustD3 = top == null && moves == 0
 
         // 人类建模实验：指定的「人类座位」用代理策略；其余座位开启 modelHuman。
-        val useProxy = humanSeat in 0..3 && cur == humanSeat
+        val useProxy = cur in heuristicSeats
         val raw = if (useProxy && proxyMode != "search") {
             aiDecideForSim(hands, cur, top, playedSet(playedMask))
         } else {
@@ -198,7 +223,10 @@ private fun playGame(
                 humanModelWeight = humanWeight,
                 humanModelSeat = humanSeat,
                 // 把「本局此前已出的牌」交给搜索：人类建模节点要靠它还原真实人类可见信息
-                initialPlayedMask = playedMask
+                initialPlayedMask = playedMask,
+                opponentModel = if (cur in selfishSeats) 1 else 0,
+                opponentTopK = oppTopK,
+                maxDepth = maxDepth
             )
         }
 

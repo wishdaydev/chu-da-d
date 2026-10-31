@@ -86,11 +86,22 @@ class GameEngine {
 
     /** 大师 AI 出牌前的「思考延迟」（毫秒），仅用于节奏，与搜索耗时叠加 */
     private val MASTER_DELAY_MS = 500L
-    /** 大师 AI 后台搜索时长预算（毫秒），可由设置项「最大思考时间(秒)」覆盖 */
+    /**
+     * 大师 AI 后台搜索时长预算（毫秒），可由设置项「最大思考时间(秒)」覆盖。
+     * 这是线上唯一的强度约束：节点数与深度上限都放到极大值，改这个值就能线性改变棋力。
+     */
     @Volatile
     var masterDeadlineMs: Long = 5000L
-    /** 大师 AI 后台搜索节点预算 */
-    private val MASTER_NODE_LIMIT = 60_000_000
+
+    /**
+     * 大师 AI 后台搜索节点预算。
+     *
+     * 线上取 [Int.MAX_VALUE] ＝实质不设节点限制，让 [masterDeadlineMs]（思考时间设置项）
+     * 成为唯一瓶颈——否则节点上限会先于时间触及，把「最大思考时间」调大也不涨棋力。
+     * 搜索内部每展开一个节点都会检查时间，因此不设节点上限不会导致卡死。
+     * 仿真侧仍由 `run-sim.sh` 的 nodeLimit 参数单独指定（例如 5 万做快速对照）。
+     */
+    private val MASTER_NODE_LIMIT = Int.MAX_VALUE
     /** 电脑玩家单回合最短耗时（毫秒）：避免电脑出牌过快导致玩家看不清节奏 */
     private val MIN_AI_TURN_MS = 1500L
     /** 提示（getHint）同步搜索时长预算（毫秒），必须小以免卡 UI */

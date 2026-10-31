@@ -39,12 +39,18 @@ internal object MasterSearch {
     private const val INF = 2_000_000          // alpha-beta 初始边界
 
     /**
-     * 迭代加深深度上限。
-     * 仅作「防止无意义递归」的安全阀——真正的停止条件是时间/节点预算，
-     * 因此取值需远大于预算内实际可达深度（4 人局通常 5~12 层），
-     * 否则搜索会在预算耗尽前提前收敛，导致「最大思考时间」设置形同虚设。
+     * 迭代加深深度上限的默认值。
+     *
+     * 仅作「防止无意义递归」的安全阀——真正的停止条件必须是时间预算，
+     * 这样「最大思考时间(秒)」设置项才真正决定搜索强度。
+     * 实测：5 秒预算下 13 张开局局面也只能跑到 32 层左右（更深的层数会先撞时间墙），
+     * 故取 64 确保线上时间永远是唯一瓶颈、深度上限不会先行截断。
+     * 仿真可用 [solve] 的 maxDepth 参数单独覆盖（如压低到 8 层做快速对照）。
      */
-    private const val MAX_DEPTH = 32
+    private const val DEFAULT_MAX_DEPTH = 64
+
+    /** 深度上限的硬边界：防止外部误传超大值导致递归过深（栈溢出） */
+    private const val MAX_DEPTH_CAP = 128
 
     /** 手数竞速评估中各分量的权重（值需落在 (-WIN/2, WIN/2) 内，避免淹没终局值） */
     private const val W_PLAYS = 600
@@ -70,15 +76,39 @@ internal object MasterSearch {
     private val ctrlWeightTL = ThreadLocal<Int>()
 
     /**
-     * 人类建模（对手建模）配置，按线程隔离，仅供仿真寻优与实验性对局使用。
+     * 人类建模强度默认值（0=关闭建模、1=完全信任 [AIDecision] 单手）。
+     *
+     * 线上取 0.8 的「软建模」：人类节点保留「代理走法 + 少量次优候选」，
+     * 既利用「真人多数情况下按启发式思路出牌」的先验来收紧搜索树，
+     * 又留出人类不按套路出牌时的容错空间（硬 1.0 会在真人反制时被反杀）。
+     */
+    private const val DEFAULT_HUMAN_MODEL_WEIGHT = 0.8
+
+    /**
+     * 人类建模（对手建模）配置，按线程隔离，可由 [solve] 参数覆盖。
      * - [humanModelWeightTL]：建模强度。0（或关闭）表示退化为全量展开、完全不影响现行逻辑；
      *   1 表示完全信任普通模式 [AIDecision]，该人类节点仅生成其启发式走法（单子节点 MIN），
      *   alpha-beta 语义仍成立；0~1 之间为「软建模」，在 [AIDecision] 走法基础上按权重补充若干「弱人类」候选。
+     *   未指定时取 [DEFAULT_HUMAN_MODEL_WEIGHT]。
      * - [humanModelSeatTL]：被建模为普通模式玩家的座位（-1 表示不建模）。
      *   其它座位的大师搜索会把该座位当代理，只生成其启发式走法而非穷举。
      */
     private val humanModelWeightTL = ThreadLocal<Double>()
     private val humanModelSeatTL = ThreadLocal<Int>()
+
+    /**
+     * 对手模型（线上默认 [OPP_SELFISH]）。
+     * - [OPP_PARANOID]：其余三家视为一个「联盟」，统一按 MIN 节点取「对我最不利」的走法。
+     *   四人各自为战时这个假设过于悲观：对手并不合力坑我，搜索会因此过度防御。
+     * - [OPP_SELFISH]：每家「各自最优」——对手节点按**该对手自己视角**的评估选走法
+     *   （保留前 K 个候选，K=[oppTopKTL]），节点值仍按我的视角取最坏情况。
+     *   即「他打他自己的算盘，我按其中对我最不利的那条做打算」，是多智能体搜索里
+     *   max^n / 贪心 best-response 的轻量近似，比联盟假设更贴近真实对局。
+     */
+    private const val OPP_PARANOID = 0
+    private const val OPP_SELFISH = 1
+    private val oppModelTL = ThreadLocal<Int>()
+    private val oppTopKTL = ThreadLocal<Int>()
 
     /**
      * 人类建模节点的决策缓存：单次 solve 内按局面键命中，避免同一人类节点被反复展开时
@@ -223,11 +253,19 @@ internal object MasterSearch {
         humanModelWeight: Double? = null,
         humanModelSeat: Int? = null,
         initialPlayedMask: Long = 0L,
+        opponentModel: Int? = null,
+        opponentTopK: Int? = null,
+        maxDepth: Int? = null,
         cancelled: () -> Boolean = { false }
     ): CardGroup? {
         ctrlWeightTL.set(ctrlWeight ?: W_CTRL)
-        humanModelWeightTL.set(humanModelWeight ?: 0.0)
+        humanModelWeightTL.set(humanModelWeight ?: DEFAULT_HUMAN_MODEL_WEIGHT)
         humanModelSeatTL.set(humanModelSeat ?: -1)
+        oppModelTL.set(opponentModel ?: OPP_SELFISH)
+        oppTopKTL.set(opponentTopK ?: 2)
+        // 深度上限：默认放开到 DEFAULT_MAX_DEPTH，使时间预算成为唯一瓶颈；
+        // 仿真可用该参数压低深度做「浅搜索」对照
+        val depthCap = (maxDepth ?: DEFAULT_MAX_DEPTH).coerceIn(1, MAX_DEPTH_CAP)
         val myHand = hands[myIndex] ?: return null
         if (myHand.isEmpty()) return null
 
@@ -252,14 +290,16 @@ internal object MasterSearch {
         val counter = longArrayOf(0L)
         // 置换表：单次决策内有效，随 solve 返回后回收；迭代加深层间复用、跨决策不污染、天然线程安全
         val tt = HashMap<TransKey, TTEntry>()
-        // 人类建模节点缓存（仅在开启建模时建立）；本次决策结束前清掉，避免 ThreadLocal 长期持有
-        if ((humanModelWeightTL.get() ?: 0.0) > 0.0) humanNodeCacheTL.set(HashMap())
+        // 人类建模节点缓存（仅在「建模开启且确实指定了座位」时建立）；本次决策结束前清掉
+        if ((humanModelWeightTL.get() ?: 0.0) > 0.0 &&
+            (humanModelSeatTL.get() ?: -1) in 0..3
+        ) humanNodeCacheTL.set(HashMap())
 
         var bestMove: Move? = rootMoves.first()
         // 根走法顺序只与牌面有关，排一次即可；后续层把上一层最优手提到首位（PV 优先）
         var rootOrdered = orderMoves(state, myIndex, rootMoves, isMax = true)
 
-        for (depth in 1..MAX_DEPTH) {
+        for (depth in 1..depthCap) {
             if (cancelled()) break
             var bestVal = -INF
             var localBest: Move? = null
@@ -384,7 +424,13 @@ internal object MasterSearch {
         if (moves.isEmpty()) return evaluate(state, myIndex)
 
         val isMax = (cur == myIndex)
-        val ordered = orderMoves(state, cur, moves, isMax, ttPreferred)
+        val ordered = if (!isMax && (oppModelTL.get() ?: OPP_PARANOID) == OPP_SELFISH) {
+            // 各自最优：先按「该对手自己的评估」筛出他真会考虑的前 K 手，再按我的视角取最坏
+            val k = (oppTopKTL.get() ?: 2).coerceAtLeast(1)
+            orderBySelfInterest(state, cur, moves).take(k)
+        } else {
+            orderMoves(state, cur, moves, isMax, ttPreferred)
+        }
         var best = if (isMax) -INF else INF
         var bestMoveAtNode: Move? = null
 
@@ -650,6 +696,40 @@ internal object MasterSearch {
         return if (preferred != null && ordered.contains(preferred)) {
             listOf(preferred) + ordered.filter { it !== preferred }
         } else ordered
+    }
+
+    /**
+     * 「各自最优」对手模型的走法筛选：把每个候选走法落地后，用**该对手自己的视角**打分，
+     * 降序排列——他只会真正考虑排在最前面的几手，而不是「怎么坑我最狠就怎么出」。
+     *
+     * 用 [quickEval] 而非完整 [evaluate]：后者每步都要跑一次合法走法枚举（判控制权），
+     * 放在对手节点的每个候选上会把开销放大一个量级；而「各自最优」只用于筛走法，
+     * 手数差这一主项足够区分对手的倾向。
+     */
+    private fun orderBySelfInterest(state: State, player: Int, moves: List<Move>): List<Move> {
+        val scored = moves.map { mv ->
+            val undo = applyMove(state, player, mv)
+            val v = if (undo.winner == player) WIN else quickEval(state, player)
+            undoMove(state, undo)
+            mv to v
+        }
+        // 能一手出完的走法自然拿到 WIN（最高），会被排到最前
+        return scored.sortedByDescending { it.second }.map { it.first }
+    }
+
+    /** 轻量评估（对手自评用）：只看「我离出完还差几手 / 几张」相对最强对手的差距 */
+    private fun quickEval(state: State, player: Int): Int {
+        val myPlays = minPlays(state.hands[player])
+        val myCards = state.hands[player].size
+        var oppPlays = Int.MAX_VALUE
+        var oppCards = Int.MAX_VALUE
+        for (i in 0..3) {
+            if (i == player) continue
+            oppPlays = minOf(oppPlays, minPlays(state.hands[i]))
+            oppCards = minOf(oppCards, state.hands[i].size)
+        }
+        return ((oppPlays - myPlays) * W_PLAYS + (oppCards - myCards) * W_CARDS)
+            .coerceIn(-WIN / 2, WIN / 2)
     }
 
     /** 从我视角评估局面：正=我领先，负=我落后 */

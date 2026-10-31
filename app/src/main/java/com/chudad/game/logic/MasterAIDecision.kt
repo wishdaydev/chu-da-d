@@ -39,10 +39,18 @@ object MasterAIDecision {
     )
 
     /**
+     * 被建模为「普通模式玩家」的座位：人类固定占 0 号座（见 GameEngine 发牌与出牌流程）。
+     * 其余三个 AI 座位搜索时会把 0 号座当成按 [AIDecision] 出牌的真人来预测。
+     */
+    const val HUMAN_SEAT = 0
+
+    /**
      * 决策入口
      * @param snapshot 全量快照（4 家手牌）
      * @param deadlineMs 搜索时长预算（毫秒）——迭代加深会持续到该预算耗尽
-     * @param nodeLimit 搜索节点预算
+     * @param nodeLimit 搜索节点预算（线上给到极大值，让时间成为唯一瓶颈）
+     * @param humanModelWeight 人类座位建模强度：0=全量展开（把人类当完美玩家）、
+     *        1=只信 [AIDecision] 单手、中间值=软建模（代理走法 + 少量次优候选）
      * @param cancelled 取消判定（重开局后旧搜索应尽快退出，避免占用后台线程）
      * @return 决定出的牌组；null 表示过牌
      */
@@ -50,6 +58,8 @@ object MasterAIDecision {
         snapshot: Snapshot,
         deadlineMs: Long = 250L,
         nodeLimit: Int = 500_000,
+        humanModelWeight: Double = 0.8,
+        humanModelSeat: Int = HUMAN_SEAT,
         cancelled: () -> Boolean = { false }
     ): CardGroup? {
         val hand = snapshot.hands[snapshot.myIndex] ?: return null
@@ -68,6 +78,10 @@ object MasterAIDecision {
                 nodeLimit = nodeLimit,
                 mustContainDiamond3 = snapshot.mustContainDiamond3,
                 mustTopBig = snapshot.mustTopBig,
+                // 人类建模：把 0 号座当普通模式玩家预测（对方模型比「完美联盟」更贴近实战）；
+                // 若当前决策者就是该座（理论不会发生），则关闭建模避免自我套娃
+                humanModelWeight = if (snapshot.myIndex == humanModelSeat) 0.0 else humanModelWeight,
+                humanModelSeat = if (snapshot.myIndex == humanModelSeat) -1 else humanModelSeat,
                 cancelled = cancelled
             )
             if (result != null) return result                 // 搜索给出的一手出牌

@@ -2734,7 +2734,7 @@ class GameSurfaceView(context: Context) : SurfaceView(context), SurfaceHolder.Ca
         drawStrategyToggle(canvas, target, bx, py + 340f * ms, bw, bh, optGap,
             "普通", "大师", masterHintStrategy, "master_hint_normal", "master_hint_master")
 
-        // 第三行：ai最大思考时间(秒)，步进器 − [数值] +（2~60，默认3，关闭时落盘）
+        // 第三行：ai最大思考时间(秒)，步进器 − [数值] +（2~60，默认5，关闭设置时落盘）
         // 数值显示在中间单元格，确保“X 秒”位于 − 与 + 之间
         buttonTextPaint.textSize = 34f * ms
         buttonTextPaint.color = Color.parseColor("#E0E0E0")

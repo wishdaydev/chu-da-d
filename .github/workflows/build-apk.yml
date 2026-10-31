@@ -3,12 +3,11 @@ name: Build & Release APK
 on:
   push:
     branches: [main]
-    # 仿真 harness、编译预检脚本、文档、截图等不影响 APK 产物，push 这些不触发构建
+    # 仿真 harness、编译预检脚本、文档等不影响 APK 产物，push 这些不触发构建
     paths-ignore:
       - 'sim/**'
       - 'check-kotlin.sh'
       - '**.md'
-      - 'screenshoot/**'
   workflow_dispatch:
     inputs:
       version_name:
@@ -71,7 +70,7 @@ jobs:
       - name: Upload APK as artifact
         uses: actions/upload-artifact@v4
         with:
-          name: DouDiZhu-debug
+          name: ChuDaD-debug
           path: app/build/outputs/apk/debug/*.apk
 
       - name: Create GitHub Release
@@ -81,9 +80,9 @@ jobs:
         run: |
           # 发布标识统一使用版本名称（去掉此前多余的 DATE 时间戳），run_number 保证唯一
           TAG="build-${{ steps.ver.outputs.app_version }}-${{ github.run_number }}"
-          APK="DouDiZhu-${{ steps.ver.outputs.app_version }}.apk"
+          APK="ChuDaD-${{ steps.ver.outputs.app_version }}.apk"
           cp app/build/outputs/apk/debug/app-debug.apk "${APK}"
           gh release create "${TAG}" "${APK}" \
             --repo "${GITHUB_REPOSITORY}" \
-            --title "DouDiZhu ${{ steps.ver.outputs.app_version }}" \
+            --title "ChuDaD ${{ steps.ver.outputs.app_version }}" \
             --notes "commit: $(git rev-parse HEAD | cut -c1-7) | 版本: ${{ steps.ver.outputs.app_version }}"

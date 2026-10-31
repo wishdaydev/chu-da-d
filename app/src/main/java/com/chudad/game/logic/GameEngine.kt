@@ -55,8 +55,8 @@ class GameEngine {
 
     /**
      * 大师模式下「电脑玩家是否使用全信息搜索」策略。
-     * 锄大D 为四人各自为战、无队友概念，故原「队友农民策略」在此语义重定义为：
-     * 大师模式中三个电脑玩家出牌是否走完美信息搜索（开启=全开挂，关闭=走普通启发式）。
+     * 锄大D 为四人各自为战、无队友概念：大师模式中三个电脑玩家出牌是否走
+     * 完美信息搜索（开启=全开挂，关闭=走普通启发式）。
      */
     var aiMasterStrategy: Difficulty = Difficulty.NORMAL
 
@@ -346,6 +346,7 @@ class GameEngine {
             hands = players.associate { it.index to it.handCards.toList() },
             lastPlay = stateMachine.lastPlayedGroup,
             lastPlayerIndex = stateMachine.lastPlayedPlayerIndex,
+            passes = stateMachine.passCount,
             currentPlayerIndex = stateMachine.currentPlayerIndex
         )
 

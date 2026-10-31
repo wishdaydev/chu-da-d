@@ -12,16 +12,19 @@ CHECK_DIR="/tmp/kotlin-check-$$"
 mkdir -p "$CHECK_DIR"
 
 # kotlinc 缺失时回退到 Gradle 自带的 kotlin-compiler-embeddable（避免「假阳性通过」）。
-# 注意：kotlin 2.0.x 编译器无法解析 JDK 21+ 的版本号，需用 JDK 17 调编译器。
-GRADLE_LIB=$(ls -d /root/.local/share/mise/installs/gradle/*/gradle-*/lib 2>/dev/null | head -1)
-JDK17=$(ls -d /root/.local/share/mise/installs/java/17 2>/dev/null | head -1)
-[ -n "$JDK17" ] && export JAVA_HOME="$JDK17" PATH="$JDK17/bin:$PATH"
+# 动态定位 sdkman 安装的 Gradle lib 目录及其内嵌的 Kotlin 编译器/标准库 jar，
+# 避免对版本号与安装路径硬编码（路径、Kotlin 版本会随环境变化）。
+GRADLE_LIB=$(for d in /root/.sdkman/candidates/gradle/*/lib; do
+    [ -f "$d"/kotlin-compiler-embeddable-*.jar ] && { echo "$d"; break; }
+done)
+KOTLIN_STDLIB=$(ls -1 "$GRADLE_LIB"/kotlin-stdlib-*.jar 2>/dev/null | head -1)
+
 if ! command -v "$KOTLINC" >/dev/null 2>&1; then
-    if [ -n "$GRADLE_LIB" ] && [ -f "$GRADLE_LIB/kotlin-compiler-embeddable-2.0.21.jar" ]; then
+    if [ -n "$GRADLE_LIB" ] && [ -f "$GRADLE_LIB"/kotlin-compiler-embeddable-*.jar ]; then
         KOTLINC() {
             java -cp "$GRADLE_LIB/*" \
                 org.jetbrains.kotlin.cli.jvm.K2JVMCompiler \
-                -cp "$GRADLE_LIB/kotlin-stdlib-2.0.21.jar" "$@"
+                -cp "$KOTLIN_STDLIB" "$@"
         }
     else
         echo "❌ 找不到 kotlinc 或 kotlin-compiler-embeddable，无法执行编译预检"

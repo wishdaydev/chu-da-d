@@ -29,8 +29,8 @@ import kotlin.concurrent.thread
  * 锄大D 游戏主 Activity
  * 使用 SurfaceView 进行 Canvas 绘制，实现完整的游戏 UI。
  *
- * 与斗地主版的差异：无叫分/无地主流程，发牌动画结束后直接进入出牌阶段；
- * 统计不再区分地主/农民子桶；大师策略「队友农民」重定义为「电脑是否全信息搜索」。
+ * 无叫分/无地主流程，发牌动画结束后直接进入出牌阶段；
+ * 统计按模式（普通/大师）独立，不区分子角色；大师策略表示「电脑是否全信息搜索」。
  */
 class MainActivity : AppCompatActivity(), GameEngineCallback {
 
@@ -417,7 +417,7 @@ class MainActivity : AppCompatActivity(), GameEngineCallback {
             // 锄大D 积分（剩余张数累计法）：
             // 赢家收取其余各家剩余手牌数之和。人类赢 → 加「其余三家剩余张数之和」；
             // 人类输 → 扣「自身剩余张数」（即应支付给赢家的牌数）。
-            // 原斗地主式「底分 10 × 2^炸弹数」在锄大D 不适用（四带一/同花顺为正常牌型，非稀有炸弹）。
+            // 积分采用剩余张数累计法（四带一/同花顺为正常牌型，无炸弹翻倍）。
             val playerCount = gameEngine.players.size
             val remaining = IntArray(playerCount) { gameEngine.getCardCount(it) }
             val humanRemaining = remaining[0]

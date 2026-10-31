@@ -14,24 +14,31 @@ import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicLong
 
 /**
- * 锄大D 4 人仿真 harness（纯 JVM，配合 sim/run-sim.sh）。
+ * 锄大D 4 人仿真 harness（纯 JVM，配合 sim/run-sim.sh，完整用法见 sim/README.md）。
  *
- * 四家全部使用大师模式完美信息搜索 [MasterSearch] 决策，用于标定搜索强度与性能：
+ * 默认四家全部使用大师模式完美信息搜索 [MasterSearch] 决策，用于标定搜索强度与性能：
  *   - 各家胜率分布（均等牌力下应接近 25%，可观察搜索是否偏向某座位/先后手）
  *   - 平均回合数（反映搜索推进效率）
  *   - 非法走法次数（应恒为 0，验证搜索始终输出合法决策）
+ *   - 平均每步搜索节点数/深度（把预算折算到别的设备时用，例如沙箱 → 手机）
  *
  * 用法: ./sim/run-sim.sh [games] [deadlineMs] [nodeLimit] [threads] [baseSeed]
+ *   固定节点预算（推荐做 A/B）：SIM_NODES=120000 ./sim/run-sim.sh 100 0 0 4 7
  *
- * 人类建模调参（对手建模）环境变量：
+ * 环境变量（对手建模相关，均按需设置）：
  *   HUMAN_MODEL_SEAT   = 被当普通模式代理的座位（默认 -1=不建模，四家均用大师搜索）；设 0..3 则
  *                        该座位改用 AIDecision（即「真实人类」一方），其余 3 座用带 modelHuman 的大师搜索。
  *   HUMAN_MODEL_WEIGHT = 建模强度（默认 0.0）。1=完全信任（人类节点仅 AIDecision 单手），
  *                        0~1=软建模（按权重补充弱人类候选），<=0=不建模（其余 3 座退化为全量展开做对照）。
- *   典型用法：
- *     全大师基线:           HUMAN_MODEL_SEAT=-1
- *     对照(人类代理+不建模): HUMAN_MODEL_SEAT=0 HUMAN_MODEL_WEIGHT=0
- *     建模寻优扫描:          HUMAN_MODEL_SEAT=0 HUMAN_MODEL_WEIGHT=1  （再扫 0.25/0.5/0.75）
+ *   HEURISTIC_SEATS    = 哪些座位用启发式（默认：仅 HUMAN_MODEL_SEAT 指定的那一个）
+ *   SELFISH_SEATS      = 哪些座位用 selfish 对手模型（默认全部；线上即为全部）
+ *   OPP_TOPK / MAX_DEPTH = 对手模型保留候选数（默认 2）/ 迭代深度上限（默认线上 64）
+ *
+ * 典型用法：
+ *   全大师基线:            HUMAN_MODEL_SEAT=-1
+ *   对照(人类代理+不建模):  HUMAN_MODEL_SEAT=0 HUMAN_MODEL_WEIGHT=0
+ *   线上配置(w=0.8):        HUMAN_MODEL_SEAT=0 HUMAN_MODEL_WEIGHT=0.8
+ *   3 大师 vs 1 启发式:     HEURISTIC_SEATS=0 SELFISH_SEATS=1,2,3
  */
 /** id → rank 查表（从已出牌集合反推点数，供人类代理构造有限信息 unseenCounts） */
 private val ID_TO_RANK_SIM = createDeck().associate { it.id to it.rank }
@@ -43,19 +50,9 @@ fun main(args: Array<String>) {
     val threads = (args.getOrNull(3)?.toIntOrNull() ?: 1).coerceAtLeast(1)
     val baseSeed = args.getOrNull(4)?.toLongOrNull() ?: 1L
 
-    // 调参支持：CTRL_W=治疗组权重（默认 15），CTRL_W_BASE=基线组权重（默认 null=与 CTRL_W 相同做对称仿真），
-    // TREAT_SEATS=使用 CTRL_W 的座位（逗号分隔，默认 "0"）。用于非对称对比：带控制权项的一方 vs 旧版(=0)。
-    val ctrlW = System.getenv("CTRL_W")?.toIntOrNull() ?: 15
-    val ctrlWBase = System.getenv("CTRL_W_BASE")?.toIntOrNull()
-    val treatSeats = (System.getenv("TREAT_SEATS") ?: "0").split(',').mapNotNull { it.trim().toIntOrNull() }.toSet()
-
     // 人类建模（对手建模）：把某个座位当普通模式 AIDecision 代理，其余座位开启 modelHuman。
     val humanSeat = System.getenv("HUMAN_MODEL_SEAT")?.toIntOrNull()?.coerceIn(-1, 3) ?: -1
     val humanWeight = System.getenv("HUMAN_MODEL_WEIGHT")?.toDoubleOrNull() ?: 0.0
-
-    // 代理策略：heuristic=普通模式 AIDecision（默认）；search=用大师搜索但预算极短（模拟「浅层搜索」版普通模式）
-    val proxyMode = System.getenv("PROXY_MODE") ?: "heuristic"
-    val proxyDeadlineMs = System.getenv("PROXY_DEADLINE_MS")?.toLongOrNull() ?: 3L
 
     // 哪些座位用启发式出牌（其余用大师搜索）。
     // 未显式指定 HEURISTIC_SEATS 时退回旧语义：HUMAN_MODEL_SEAT 指定的座位即为唯一启发式座位。
@@ -79,11 +76,9 @@ fun main(args: Array<String>) {
     println(
         "锄大D 4人仿真: games=$games deadline=${deadlineMs}ms " +
             "nodeLimit=$nodeLimit threads=$threads baseSeed=$baseSeed " +
-            "CTRL_W=$ctrlW CTRL_W_BASE=$ctrlWBase TREAT_SEATS=$treatSeats " +
             "HUMAN_MODEL_SEAT=$humanSeat HUMAN_MODEL_WEIGHT=$humanWeight " +
             "HEURISTIC_SEATS=$heuristicSeats SELFISH_SEATS=$selfishSeats K=$oppTopK " +
-            "MAX_DEPTH=${maxDepth ?: 64} " +
-            "PROXY_MODE=$proxyMode PROXY_DEADLINE=${proxyDeadlineMs}ms"
+            "MAX_DEPTH=${maxDepth ?: 64}"
     )
 
     val wins = IntArray(4)
@@ -91,6 +86,11 @@ fun main(args: Array<String>) {
     val illegal = AtomicInteger(0)
     val crashed = AtomicInteger(0)
     val finished = AtomicInteger(0)
+    // 搜索实测量：平均每步节点/深度反映「预算实际花掉多少」，用于把结论折算到别的设备
+    val totalNodes = AtomicLong(0)
+    val totalDepth = AtomicLong(0)
+    val totalSteps = AtomicLong(0)
+    val deepest = AtomicInteger(0)
     val illegalSamples = java.util.Collections.synchronizedList(ArrayList<String>())
     val t0 = System.currentTimeMillis()
 
@@ -98,12 +98,16 @@ fun main(args: Array<String>) {
         val seed = baseSeed + idx * 2654435761L
         try {
             val r = playGame(
-                seed, deadlineMs, nodeLimit, ctrlW, ctrlWBase, treatSeats, humanSeat, humanWeight,
-                heuristicSeats, oppTopK, selfishSeats, proxyMode, proxyDeadlineMs, maxDepth
+                seed, deadlineMs, nodeLimit, humanSeat, humanWeight,
+                heuristicSeats, oppTopK, selfishSeats, maxDepth
             )
             synchronized(wins) { if (r.winner in 0..3) wins[r.winner]++ }
             totalMoves.addAndGet(r.moves.toLong())
             if (r.winner in 0..3) finished.incrementAndGet()
+            totalNodes.addAndGet(r.totalNodes.toLong())
+            totalDepth.addAndGet(r.totalDepth.toLong())
+            totalSteps.addAndGet(r.searchSteps.toLong())
+            if (r.maxDepth > deepest.get()) deepest.set(r.maxDepth)
             if (r.illegalSample != null) {
                 illegal.incrementAndGet()
                 if (illegalSamples.size < 3) illegalSamples.add(r.illegalSample)
@@ -145,6 +149,16 @@ fun main(args: Array<String>) {
         println("对照: seat=$humanSeat 用 AIDecision 代理，其余 3 座不做人类建模（全量展开）")
     }
     println("平均回合数: ${"%.1f".format(avg)}  (完成局数 $n/$games, 异常 $crashed)")
+    val steps = totalSteps.get()
+    if (steps > 0) {
+        val avgNodes = totalNodes.get().toDouble() / steps
+        val avgDepth = totalDepth.get().toDouble() / steps
+        val budgetTag = if (deadlineMs >= 100_000L) "固定节点 ${nodeLimit}节点" else "${deadlineMs}ms"
+        println(
+            "搜索量: 平均每步 ${"%.0f".format(avgNodes)} 节点 / ${"%.1f".format(avgDepth)} 层 " +
+                "（最深 ${deepest.get()} 层，步数 $steps，预算 $budgetTag）"
+        )
+    }
     println("非法走法次数: ${illegal.get()}")
     illegalSamples.forEach { println("  非法样本: $it") }
     println("总耗时: ${dt}ms  (worker=$workers)")
@@ -157,29 +171,36 @@ private fun deal(seed: Long): Array<MutableList<Card>> {
     return Array(4) { i -> deck.subList(i * 13, i * 13 + 13).toMutableList() }
 }
 
-/** 单局结果：赢家、回合数、首个非法走法样本（null 表示全程合法） */
-private class GameResult(val winner: Int, val moves: Int, val illegalSample: String?)
+/** 单局结果：赢家、回合数、首个非法走法样本（null 表示全程合法）+ 搜索实测量 */
+private class GameResult(
+    val winner: Int,
+    val moves: Int,
+    val illegalSample: String?,
+    /** 走大师搜索的步数（启发式代理的步不计） */
+    val searchSteps: Int,
+    /** 上述步累计的搜索节点数 */
+    val totalNodes: Long,
+    /** 上述步累计的「完整跑完的深度」之和，除以 searchSteps 即平均深度 */
+    val totalDepth: Long,
+    /** 本局单步达到的最深迭代深度 */
+    val maxDepth: Int
+)
 
 /**
  * 单局：
  *  - [humanSeat] 在 0..3 时，该座位用普通模式 [AIDecision] 当「真实人类」代理；
  *  - 其余座位用 [MasterSearch] 决策，并对 [humanSeat] 开启人类建模（[humanWeight]）。
- *  - [humanSeat] 为 -1 时四家均用大师搜索（全大师基线，与历史行为一致）。
+ *  - [humanSeat] 为 -1 时四家均用大师搜索（全大师基线）。
  */
 private fun playGame(
     seed: Long,
     deadlineMs: Long,
     nodeLimit: Int,
-    ctrlW: Int,
-    ctrlWBase: Int?,
-    treatSeats: Set<Int>,
     humanSeat: Int,
     humanWeight: Double,
     heuristicSeats: Set<Int>,
     oppTopK: Int,
     selfishSeats: Set<Int>,
-    proxyMode: String,
-    proxyDeadlineMs: Long,
     maxDepth: Int?
 ): GameResult {
     val hands = deal(seed)
@@ -194,18 +215,23 @@ private fun playGame(
     var playedMask = 0L
     var illegalSample: String? = null
 
+    // 搜索实测量累加（反映「预算实际花掉多少」，用于跨设备折算）
+    var steps = 0
+    var nodesSum = 0L
+    var depthSum = 0L
+    var maxD = 0
+    fun finish(winner: Int) = GameResult(winner, moves, illegalSample, steps, nodesSum, depthSum, maxD)
+
     while (true) {
         val hand = hands[cur]
-        if (hand.isEmpty()) return GameResult(cur, moves, illegalSample)
+        if (hand.isEmpty()) return finish(cur)
 
-        // 非对称调参：治疗组座位用 CTRL_W，基线组用 CTRL_W_BASE（未设则全部同用 CTRL_W）
-        val w = if (ctrlWBase != null && cur !in treatSeats) ctrlWBase else ctrlW
         // 首手（全场第一手）：必须含 ♦3
         val mustD3 = top == null && moves == 0
 
-        // 人类建模实验：指定的「人类座位」用代理策略；其余座位开启 modelHuman。
+        // 人类建模实验：指定的「人类座位」用 AIDecision 代理；其余座位开启 modelHuman。
         val useProxy = cur in heuristicSeats
-        val raw = if (useProxy && proxyMode != "search") {
+        val raw = if (useProxy) {
             aiDecideForSim(hands, cur, top, playedSet(playedMask))
         } else {
             MasterSearch.solve(
@@ -215,11 +241,9 @@ private fun playGame(
                 topPlayer = topPlayer,
                 passes = passes,
                 current = cur,
-                // 代理座位用极短预算＝「浅层搜索」版普通模式；其余座位用正式预算
-                deadlineMs = if (useProxy) proxyDeadlineMs else deadlineMs,
+                deadlineMs = deadlineMs,
                 nodeLimit = nodeLimit,
                 mustContainDiamond3 = mustD3,
-                ctrlWeight = w,
                 humanModelWeight = humanWeight,
                 humanModelSeat = humanSeat,
                 // 把「本局此前已出的牌」交给搜索：人类建模节点要靠它还原真实人类可见信息
@@ -227,7 +251,13 @@ private fun playGame(
                 opponentModel = if (cur in selfishSeats) 1 else 0,
                 opponentTopK = oppTopK,
                 maxDepth = maxDepth
-            )
+            ).also {
+                steps++
+                nodesSum += MasterSearch.lastSearchNodes
+                val d = MasterSearch.lastSearchDepth
+                depthSum += d
+                if (d > maxD) maxD = d
+            }
         }
 
         // 合法性校验（诊断用）：不合法时用「最小合法走法」推进，避免非法牌进入局面把后续统计带偏
@@ -243,7 +273,7 @@ private fun playGame(
             decision = legal.minWithOrNull(compareBy({ it.mainRank }, { it.cards.size }))
         }
         // 自由出牌却无任何合法走法：局面已异常，终止本局（避免 cur=-1 后越界）
-        if (decision == null && top == null) return GameResult(-1, moves, illegalSample)
+        if (decision == null && top == null) return finish(-1)
 
         if (decision == null) {
             passes++
@@ -258,11 +288,11 @@ private fun playGame(
                 playedMask = playedMask or (1L shl c.id)
             }
             hand.removeAll(decision.cards)
-            if (hand.isEmpty()) return GameResult(cur, moves, illegalSample)
+            if (hand.isEmpty()) return finish(cur)
             top = decision; topPlayer = cur; passes = 0; cur = (cur + 1) % 4
         }
         moves++
-        if (moves > 2000) return GameResult(-1, moves, illegalSample)  // 异常保护
+        if (moves > 2000) return finish(-1)  // 异常保护
     }
 }
 

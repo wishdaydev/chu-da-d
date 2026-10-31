@@ -117,6 +117,22 @@ internal object MasterSearch {
      */
     private val humanNodeCacheTL = ThreadLocal<HashMap<TransKey, HumanNode>>()
 
+    /**
+     * 最近一次 [solve] 的搜索实测量（按线程隔离，仅诊断/性能基准用，不参与决策）。
+     *
+     * 存在意义：让「预算 → 实际搜索量」可观测。时间预算下同样 300ms，开局与中局能搜到的
+     * 节点数相差近 1.7 倍（走法生成成本不同），只有测出节点数才能把某个设备/某个档位
+     * 折算到另一个设备（例如把沙箱仿真折算到手机真机）。
+     */
+    private val lastNodesTL = ThreadLocal<Int>()
+    private val lastDepthTL = ThreadLocal<Int>()
+
+    /** 最近一次 solve 的搜索节点数（未开始搜索时为 0） */
+    val lastSearchNodes: Int get() = lastNodesTL.get() ?: 0
+
+    /** 最近一次 solve 完整跑完的迭代深度（层 = ply，4 层约一圈） */
+    val lastSearchDepth: Int get() = lastDepthTL.get() ?: 0
+
     /** 人类建模节点缓存条目：[aiMove] 为代理选中走法，[fullMoves] 为该局面全部合法走法（软建模用） */
     private class HumanNode(val aiMove: Move, val fullMoves: List<Move>)
 
@@ -263,6 +279,9 @@ internal object MasterSearch {
         humanModelSeatTL.set(humanModelSeat ?: -1)
         oppModelTL.set(opponentModel ?: OPP_SELFISH)
         oppTopKTL.set(opponentTopK ?: 2)
+        // 先清零：本次若提前返回（无手牌/无走法），调用方读到的必须是 0 而不是上一次的残留值
+        lastNodesTL.set(0)
+        lastDepthTL.set(0)
         // 深度上限：默认放开到 DEFAULT_MAX_DEPTH，使时间预算成为唯一瓶颈；
         // 仿真可用该参数压低深度做「浅搜索」对照
         val depthCap = (maxDepth ?: DEFAULT_MAX_DEPTH).coerceIn(1, MAX_DEPTH_CAP)
@@ -298,6 +317,7 @@ internal object MasterSearch {
         var bestMove: Move? = rootMoves.first()
         // 根走法顺序只与牌面有关，排一次即可；后续层把上一层最优手提到首位（PV 优先）
         var rootOrdered = orderMoves(state, myIndex, rootMoves, isMax = true)
+        var completedDepth = 0
 
         for (depth in 1..depthCap) {
             if (cancelled()) break
@@ -324,6 +344,7 @@ internal object MasterSearch {
                 val best = localBest
                 if (best != null) {
                     bestMove = best
+                    completedDepth = depth
                     // 上一层最优手提到首位：下一层更早拿到好上界，提升 alpha-beta 剪枝效率
                     rootOrdered = listOf(best) + rootOrdered.filter { it !== best }
                 }
@@ -335,6 +356,8 @@ internal object MasterSearch {
         }
 
         humanNodeCacheTL.remove()
+        lastNodesTL.set(counter[0].toInt())
+        lastDepthTL.set(completedDepth)
         return when (val m = bestMove) {
             is Move.Play -> m.group
             is Move.Pass -> null

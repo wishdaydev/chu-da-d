@@ -499,6 +499,8 @@ class GameSurfaceView(context: Context) : SurfaceView(context), SurfaceHolder.Ca
     /** 备份与还原：导出/导入回调（由 MainActivity 注入，负责启动 SAF 系统选择器） */
     var onExportRequested: (() -> Unit)? = null
     var onImportRequested: (() -> Unit)? = null
+    /** 性能测试回调（由 MainActivity 注入：弹预算输入 → 跑搜索基准 → 弹可复制结果） */
+    var onPerfTestRequested: (() -> Unit)? = null
     /** 导入二次确认：解析成功后置位，弹窗等待用户确认；确认后由 onImportConfirmed 应用 */
     var importConfirmPending = false
     var onImportConfirmed: (() -> Unit)? = null
@@ -1379,6 +1381,10 @@ class GameSurfaceView(context: Context) : SurfaceView(context), SurfaceHolder.Ca
             action == "master_think_inc" -> {
                 masterThinkSeconds = (masterThinkSeconds + 1).coerceAtMost(60)
                 refresh()
+            }
+            action == "perf_test" -> {
+                hapticActionConfirm()
+                onPerfTestRequested?.invoke()
             }
         }
     }
@@ -2806,6 +2812,12 @@ class GameSurfaceView(context: Context) : SurfaceView(context), SurfaceHolder.Ca
         buttonTextPaint.textSize = 36f * ms
         buttonTextPaint.color = Color.WHITE
         canvas.drawText("${masterThinkSeconds} 秒", px + pw / 2f, sby + 80f * ms / 2f + 18f * ms, buttonTextPaint)
+
+        // 第三行：性能测试（弹窗输入预算 → 跑 10 组开局 → 给出可复制的节点/层数报表）
+        // 用途：把「本机在预算内能搜多少节点」量出来，与沙箱结果对齐，得到手机/桌面算力比
+        // 高度取 92*ms：addButton 内文字固定 56*uiScale，按钮太矮会显得字顶到边框
+        addButton(canvas, target, "性能测试", px + 40f * ms, py + 512f * ms, pw - 80f * ms, 92f * ms,
+            Palette.btnBlue, Palette.btnBlueDark, "perf_test")
 
         // 底部说明：两行，说明电脑固定走大师搜索、思考时间对强度与节奏的影响
         buttonTextPaint.textSize = 28f * ms

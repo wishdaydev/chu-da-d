@@ -9,10 +9,12 @@ import android.view.WindowInsets
 import android.view.WindowInsetsController
 import android.view.WindowManager
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.appcompat.app.AlertDialog
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.view.WindowCompat
 import com.chudad.game.logic.GameEngine
 import com.chudad.game.logic.GameEngineCallback
+import com.chudad.game.logic.PerfBench
 import com.chudad.game.logic.ScoreCalculator
 import com.chudad.game.model.Card
 import com.chudad.game.model.CardGroup
@@ -300,6 +302,9 @@ class MainActivity : AppCompatActivity(), GameEngineCallback {
         gameSurfaceView.onImportRequested = { launchImportBackup() }
         gameSurfaceView.onImportConfirmed = { applyImportedBackup() }
 
+        // 性能测试（把本机算力折算成「预算内能搜多少节点」，与沙箱结果对齐）
+        gameSurfaceView.onPerfTestRequested = { showPerfTestDialog() }
+
         setContentView(gameSurfaceView)
         applyImmersiveFullscreen()
     }
@@ -473,6 +478,118 @@ class MainActivity : AppCompatActivity(), GameEngineCallback {
     /** 轻量系统提示（用于备份导入/导出等操作反馈） */
     private fun toast(msg: String) {
         android.widget.Toast.makeText(this, msg, android.widget.Toast.LENGTH_SHORT).show()
+    }
+
+    // ==================== 性能测试 ====================
+
+    /**
+     * 性能测试入口：输入单步思考预算（毫秒）→ 后台跑 10 组开局 → 弹出可复制报表。
+     *
+     * 为什么需要它：仿真是按「节点预算」跑的（跨设备确定），而手机是按「时间预算」跑的。
+     * 两者之间只有一个换算系数，就是本机每秒能搜多少节点——只能实测。
+     * 手机跑一次本测试，与沙箱 `./sim/run-sim.sh perf 300` 的数字相除，即得算力比。
+     */
+    private fun showPerfTestDialog() {
+        val density = resources.displayMetrics.density
+        val input = android.widget.EditText(this).apply {
+            setText("300")
+            inputType = android.text.InputType.TYPE_CLASS_NUMBER
+            setSelectAllOnFocus(true)
+            textSize = 20f
+        }
+        val wrap = android.widget.FrameLayout(this).apply {
+            setPadding((24 * density).toInt(), (8 * density).toInt(), (24 * density).toInt(), 0)
+            addView(
+                input,
+                android.widget.FrameLayout.LayoutParams(
+                    android.view.ViewGroup.LayoutParams.MATCH_PARENT,
+                    android.view.ViewGroup.LayoutParams.WRAP_CONTENT
+                )
+            )
+        }
+        AlertDialog.Builder(this)
+            .setTitle("性能测试")
+            .setMessage(
+                "输入单步思考时间预算（毫秒），建议 300（与沙箱基准同档）。\n\n" +
+                    "将跑 10 组标准开局，测第一个出牌的 AI 在该预算内能搜多少节点、多少层，" +
+                    "结果可一键复制用于机型对齐。\n\n" +
+                    "耗时约「预算 × 12」（含 2 组预热）。"
+            )
+            .setView(wrap)
+            .setPositiveButton("开始") { _, _ ->
+                startPerfTest(input.text.toString().toLongOrNull() ?: 300L)
+            }
+            .setNegativeButton("取消", null)
+            .show()
+    }
+
+    /** 后台线程跑基准；期间显示不可取消的进度框（10×预算最长可达数十秒，主线程会 ANR） */
+    private fun startPerfTest(budgetMs: Long) {
+        val budget = budgetMs.coerceIn(50L, 20000L)
+        val progress = AlertDialog.Builder(this)
+            .setTitle("性能测试中")
+            .setMessage("预算 ${budget}ms × 10 组，请稍候…")
+            .setCancelable(false)
+            .create()
+        progress.show()
+        thread(name = "perf-bench") {
+            val report = try {
+                PerfBench.run(budget)
+            } catch (t: Throwable) {
+                null
+            }
+            runOnUiThread {
+                if (isFinishing || isDestroyed) return@runOnUiThread
+                progress.dismiss()
+                if (report == null) {
+                    toast("性能测试失败")
+                } else {
+                    showPerfResult(report)
+                }
+            }
+        }
+    }
+
+    /** 结果弹窗：等宽字体 + 可选中 + 一键复制（数字列必须对齐，方便逐行比对） */
+    private fun showPerfResult(report: PerfBench.Report) {
+        val density = resources.displayMetrics.density
+        val full = PerfBench.Report(report.budgetMs, report.samples, perfDeviceInfo())
+        val text = full.toText()
+
+        val tv = android.widget.TextView(this).apply {
+            typeface = android.graphics.Typeface.MONOSPACE
+            textSize = 11f
+            setTextIsSelectable(true)
+            this.text = text
+            setPadding((16 * density).toInt(), (8 * density).toInt(), (16 * density).toInt(), 0)
+        }
+        val scroll = android.widget.ScrollView(this).apply { addView(tv) }
+
+        AlertDialog.Builder(this)
+            .setTitle("性能测试结果")
+            .setView(scroll)
+            .setPositiveButton("复制") { _, _ ->
+                val cm = getSystemService(android.content.Context.CLIPBOARD_SERVICE)
+                    as android.content.ClipboardManager
+                cm.setPrimaryClip(android.content.ClipData.newPlainText("perf-bench", text))
+                toast("已复制到剪贴板")
+            }
+            .setNegativeButton("关闭", null)
+            .show()
+    }
+
+    /** 设备信息行：机型/系统/ABI/核数，用于判断「哪台机器跑的这份数据」 */
+    private fun perfDeviceInfo(): String {
+        val abi = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP) {
+            Build.SUPPORTED_ABIS.joinToString("/")
+        } else {
+            Build.CPU_ABI
+        }
+        val cores = Runtime.getRuntime().availableProcessors()
+        val maxMb = Runtime.getRuntime().maxMemory() / 1024L / 1024L
+        return "设备: ${Build.MANUFACTURER} ${Build.MODEL} / Android ${Build.VERSION.RELEASE}" +
+            "（SDK ${Build.VERSION.SDK_INT}）/ ABI $abi\n" +
+            "CPU 核数 $cores / 堆上限 ${maxMb}MB"
     }
 
     override fun onPause() {

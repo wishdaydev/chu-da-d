@@ -4,6 +4,7 @@ import com.chudad.game.model.Card
 import com.chudad.game.model.CardGroup
 import com.chudad.game.model.CardType
 import com.chudad.game.model.Suit
+import com.chudad.game.model.createDeck
 
 /**
  * 大师模式「4 人完美信息搜索」求解器（锄大D / Big Two）
@@ -68,11 +69,29 @@ internal object MasterSearch {
      */
     private val ctrlWeightTL = ThreadLocal<Int>()
 
+    /**
+     * 人类建模（对手建模）配置，按线程隔离，仅供仿真寻优与实验性对局使用。
+     * - [humanModelWeightTL]：建模强度。0（或关闭）表示退化为全量展开、完全不影响现行逻辑；
+     *   1 表示完全信任普通模式 [AIDecision]，该人类节点仅生成其启发式走法（单子节点 MIN），
+     *   alpha-beta 语义仍成立；0~1 之间为「软建模」，在 [AIDecision] 走法基础上按权重补充若干「弱人类」候选。
+     * - [humanModelSeatTL]：被建模为普通模式玩家的座位（-1 表示不建模）。
+     *   其它座位的大师搜索会把该座位当代理，只生成其启发式走法而非穷举。
+     */
+    private val humanModelWeightTL = ThreadLocal<Double>()
+    private val humanModelSeatTL = ThreadLocal<Int>()
+
     /** A-2-3-4-5：A 作 1 时的最小顺子（点数序列，14=A、15=2） */
     private val A2345 = listOf(3, 4, 5, 14, 15)
 
     /** 单张牌的位掩码（id ∈ 0..51，适配 64 位） */
     private fun cardMask(card: Card): Long = 1L shl card.id
+
+    /** id → rank 查表（从「已出牌位掩码」反推点数，用于构造有限信息 unseenCounts） */
+    private val ID_TO_RANK: IntArray = run {
+        val a = IntArray(52)
+        for (c in createDeck()) a[c.id] = c.rank
+        a
+    }
 
     /** 单手牌的位掩码（按 card.id 置位，与顺序无关，直接作为局面键的可规范分量） */
     private fun handMask(hand: List<Card>): Long {
@@ -115,10 +134,12 @@ internal object MasterSearch {
     /** 内部搜索状态（就地变更 + 撤销，避免大量拷贝） */
     private class State(
         val hands: Array<MutableList<Card>>,
+        val myIndex: Int,
         var cur: Int,
         var top: CardGroup?,
         var topPlayer: Int,
-        var passes: Int
+        var passes: Int,
+        var playedMask: Long = 0L
     )
 
     // 手数评估缓存（纯函数，按手牌位掩码命中；ConcurrentHashMap 以支持仿真多线程）
@@ -189,15 +210,21 @@ internal object MasterSearch {
         mustContainDiamond3: Boolean = false,
         mustTopBig: Boolean = false,
         ctrlWeight: Int? = null,
+        humanModelWeight: Double? = null,
+        humanModelSeat: Int? = null,
         cancelled: () -> Boolean = { false }
     ): CardGroup? {
         ctrlWeightTL.set(ctrlWeight ?: W_CTRL)
+        humanModelWeightTL.set(humanModelWeight ?: 0.0)
+        humanModelSeatTL.set(humanModelSeat ?: -1)
         val myHand = hands[myIndex] ?: return null
         if (myHand.isEmpty()) return null
 
         val state = State(
             hands = Array(4) { i -> hands[i]?.toMutableList() ?: mutableListOf() },
+            myIndex = myIndex,
             cur = current,
+            playedMask = 0L,
             top = if (topGroup?.type == CardType.INVALID) null else topGroup,
             topPlayer = topPlayer,
             passes = passes
@@ -392,6 +419,14 @@ internal object MasterSearch {
         player: Int,
         forbidTopBigPass: Boolean = false
     ): List<Move> {
+        // 人类建模分支（仅仿真/实验）：把指定座位当成普通模式 [AIDecision] 代理，
+        // 只生成其启发式走法而非穷举。权重 0 / 关闭时直接走下方全量展开，与现行行为一致。
+        val hmSeat = humanModelSeatTL.get() ?: -1
+        val hmW = humanModelWeightTL.get() ?: 0.0
+        if (hmW > 0.0 && hmSeat == player && state.myIndex != hmSeat) {
+            return generateHumanMoves(state, player, hmW)
+        }
+
         val hand = state.hands[player]
         val moves = mutableListOf<Move>()
         val plays = CardRuleEngine.findAllValidPlays(hand, state.top)
@@ -414,6 +449,73 @@ internal object MasterSearch {
         val mayPass = state.top != null && !(forbidTopBigPass && topBig && moves.isNotEmpty())
         if (mayPass) moves.add(Move.Pass)
         return moves
+    }
+
+    /**
+     * 人类建模走法生成：把 [player] 当成普通模式 [AIDecision] 代理。
+     * - 权重 ≥1：完全信任，仅返回 [AIDecision] 给出的那手（单子节点 MIN），alpha-beta 仍成立。
+     * - 0<权重<1（软建模）：在 [AIDecision] 走法基础上，按权重插值补充「弱人类」候选走法
+     *   （便宜优先，近似普通模式倾向），既不盲目信模型、也给搜索留一点最坏情况余地。
+     * 上下文（其余 3 家手牌数、未见各点数张数、顶大义务、首手方块 3）由完美信息局面直接构造。
+     */
+    private fun generateHumanMoves(state: State, player: Int, weight: Double): List<Move> {
+        val hand = state.hands[player]
+        val topBig = state.hands[(player + 1) % 4].size == 1
+        val isGameStart = state.top == null && state.hands.all { it.size == 13 }
+
+        // 构造 AIDecision 上下文：其余 3 家手牌数（可见）+ 各点数未见张数（= 不在我手且尚未被出过的牌，
+        // 即真实人类能掌握的信息上限，而非完美信息全知）。开局时未见=其余 39 张；随出牌推进逐步减少。
+        val oppCounts = IntArray(3)
+        val own = IntArray(16)
+        for (c in hand) own[c.rank]++
+        val playedCnt = IntArray(16)
+        var m = state.playedMask
+        while (m != 0L) {
+            val id = m.countTrailingZeroBits()
+            m = m and (m - 1)
+            playedCnt[ID_TO_RANK[id]]++
+        }
+        val unseen = IntArray(16)
+        for (r in 3..15) unseen[r] = 4 - own[r] - playedCnt[r]
+        var k = 0
+        for (i in 0..3) {
+            if (i == player) continue
+            oppCounts[k++] = state.hands[i].size
+        }
+        val decision = AIDecision.decide(
+            hand = hand,
+            lastPlay = state.top,
+            opponentCardCounts = oppCounts,
+            unseenCounts = unseen,
+            requireDiamond3 = isGameStart,
+            mustTopBig = topBig
+        )
+        val aiMove: Move = if (decision == null) Move.Pass else Move.Play(decision)
+
+        if (weight >= 1.0) return listOf(aiMove)
+
+        // 软建模：枚举全部合法走法（含顶大过滤），按「便宜优先」排序补充候选，数量随权重插值。
+        // 权重→0 时 beam 趋近全量，退化为现行全展开行为（但此时分支已不进入，这里仅作安全阀）。
+        val fullMoves = mutableListOf<Move>()
+        for (g in CardRuleEngine.findAllValidPlays(hand, state.top)) fullMoves.add(Move.Play(g))
+        if (state.top != null) fullMoves.add(Move.Pass)
+        if (topBig) {
+            val maxCard = hand.maxWithOrNull(compareBy({ it.rank }, { it.suit.order }))
+            fullMoves.removeIf { mv ->
+                mv is Move.Play && mv.group.type == CardType.SINGLE &&
+                    maxCard != null && mv.group.cards.singleOrNull()?.id != maxCard.id
+            }
+        }
+        val beam = maxOf(1, kotlin.math.round(1 + (fullMoves.size - 1) * (1 - weight)).toInt())
+        if (beam >= fullMoves.size) return fullMoves
+        val rest = fullMoves.filter { it !== aiMove }.map { m ->
+            val key = when (m) {
+                is Move.Pass -> -1
+                is Move.Play -> m.group.mainRank
+            }
+            m to key
+        }.sortedBy { it.second }.map { it.first }.take(beam - 1)
+        return listOf(aiMove) + rest
     }
 
     /** 应用走法（就地变更 state），返回可撤销的快照 */
@@ -440,6 +542,9 @@ internal object MasterSearch {
                 val g = mv.group
                 val cards = g.cards
                 state.hands[player].removeAll(cards)
+                var pm = state.playedMask
+                for (c in cards) pm = pm or cardMask(c)
+                state.playedMask = pm
                 val winner = if (state.hands[player].isEmpty()) player else -1
                 state.top = g
                 state.topPlayer = player
@@ -458,6 +563,9 @@ internal object MasterSearch {
         state.passes = undo.prevPasses
         if (undo.removed != null) {
             state.hands[undo.player].addAll(undo.removed)
+            var mask = 0L
+            for (c in undo.removed) mask = mask or cardMask(c)
+            state.playedMask = state.playedMask and mask.inv()
         }
     }
 

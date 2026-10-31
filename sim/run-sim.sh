@@ -19,6 +19,7 @@ build_and_run() {
         kotlinc \
             app/src/main/java/com/chudad/game/model/*.kt \
             app/src/main/java/com/chudad/game/logic/CardRuleEngine.kt \
+            app/src/main/java/com/chudad/game/logic/AIDecision.kt \
             app/src/main/java/com/chudad/game/logic/MasterSearch.kt \
             sim/SimMain.kt \
             -d "$OUT/classes" || { echo "❌ 编译失败"; exit 1; }
@@ -30,6 +31,7 @@ build_and_run() {
             -cp "$KOTLIN_STDLIB" \
             app/src/main/java/com/chudad/game/model/*.kt \
             app/src/main/java/com/chudad/game/logic/CardRuleEngine.kt \
+            app/src/main/java/com/chudad/game/logic/AIDecision.kt \
             app/src/main/java/com/chudad/game/logic/MasterSearch.kt \
             sim/SimMain.kt \
             -d "$OUT/classes" || { echo "❌ 编译失败"; exit 1; }

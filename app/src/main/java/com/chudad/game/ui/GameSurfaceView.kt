@@ -1261,6 +1261,11 @@ class GameSurfaceView(context: Context) : SurfaceView(context), SurfaceHolder.Ca
                 }
             }
             action == "pass" -> {
+                // 顶大义务：下家报单且能压过桌面单张时，不允许过牌，给出明确提示
+                if (gameEngine.mustTopBigPlay(0)) {
+                    rejectPlay("下家报单，能压必须出最大单张", 2000)
+                    return
+                }
                 hapticActionConfirm()
                 gameEngine.humanPass()
             }

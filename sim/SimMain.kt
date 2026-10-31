@@ -1,7 +1,9 @@
 package com.chudad.sim
 
+import com.chudad.game.logic.AIDecision
 import com.chudad.game.logic.CardRuleEngine
 import com.chudad.game.logic.MasterSearch
+import com.chudad.game.model.createDeck
 import com.chudad.game.model.Card
 import com.chudad.game.model.CardGroup
 import com.chudad.game.model.createDeck
@@ -18,7 +20,20 @@ import java.util.concurrent.atomic.AtomicLong
  *   - 非法走法次数（应恒为 0，验证搜索始终输出合法决策）
  *
  * 用法: ./sim/run-sim.sh [games] [deadlineMs] [nodeLimit] [threads] [baseSeed]
+ *
+ * 人类建模调参（对手建模）环境变量：
+ *   HUMAN_MODEL_SEAT   = 被当普通模式代理的座位（默认 -1=不建模，四家均用大师搜索）；设 0..3 则
+ *                        该座位改用 AIDecision（即「真实人类」一方），其余 3 座用带 modelHuman 的大师搜索。
+ *   HUMAN_MODEL_WEIGHT = 建模强度（默认 0.0）。1=完全信任（人类节点仅 AIDecision 单手），
+ *                        0~1=软建模（按权重补充弱人类候选），<=0=不建模（其余 3 座退化为全量展开做对照）。
+ *   典型用法：
+ *     全大师基线:           HUMAN_MODEL_SEAT=-1
+ *     对照(人类代理+不建模): HUMAN_MODEL_SEAT=0 HUMAN_MODEL_WEIGHT=0
+ *     建模寻优扫描:          HUMAN_MODEL_SEAT=0 HUMAN_MODEL_WEIGHT=1  （再扫 0.25/0.5/0.75）
  */
+/** id → rank 查表（从已出牌集合反推点数，供人类代理构造有限信息 unseenCounts） */
+private val ID_TO_RANK_SIM = createDeck().associate { it.id to it.rank }
+
 fun main(args: Array<String>) {
     val games = args.getOrNull(0)?.toIntOrNull() ?: 200
     val deadlineMs = args.getOrNull(1)?.toLongOrNull() ?: 50L
@@ -32,10 +47,15 @@ fun main(args: Array<String>) {
     val ctrlWBase = System.getenv("CTRL_W_BASE")?.toIntOrNull()
     val treatSeats = (System.getenv("TREAT_SEATS") ?: "0").split(',').mapNotNull { it.trim().toIntOrNull() }.toSet()
 
+    // 人类建模（对手建模）：把某个座位当普通模式 AIDecision 代理，其余座位开启 modelHuman。
+    val humanSeat = System.getenv("HUMAN_MODEL_SEAT")?.toIntOrNull()?.coerceIn(-1, 3) ?: -1
+    val humanWeight = System.getenv("HUMAN_MODEL_WEIGHT")?.toDoubleOrNull() ?: 0.0
+
     println(
         "锄大D 4人仿真: games=$games deadline=${deadlineMs}ms " +
             "nodeLimit=$nodeLimit threads=$threads baseSeed=$baseSeed " +
-            "CTRL_W=$ctrlW CTRL_W_BASE=$ctrlWBase TREAT_SEATS=$treatSeats"
+            "CTRL_W=$ctrlW CTRL_W_BASE=$ctrlWBase TREAT_SEATS=$treatSeats " +
+            "HUMAN_MODEL_SEAT=$humanSeat HUMAN_MODEL_WEIGHT=$humanWeight"
     )
 
     val wins = IntArray(4)
@@ -45,7 +65,9 @@ fun main(args: Array<String>) {
 
     val runOne: (Int) -> Unit = { idx ->
         val seed = baseSeed + idx * 2654435761L
-        val (winner, moves, bad) = playGame(seed, deadlineMs, nodeLimit, ctrlW, ctrlWBase, treatSeats)
+        val (winner, moves, bad) = playGame(
+            seed, deadlineMs, nodeLimit, ctrlW, ctrlWBase, treatSeats, humanSeat, humanWeight
+        )
         synchronized(wins) { if (winner in 0..3) wins[winner]++ }
         totalMoves.addAndGet(moves.toLong())
         if (bad) illegal.incrementAndGet()
@@ -78,14 +100,22 @@ private fun deal(seed: Long): Array<MutableList<Card>> {
     return Array(4) { i -> deck.subList(i * 13, i * 13 + 13).toMutableList() }
 }
 
-/** 单局：四家均用 [MasterSearch] 决策。返回 (winner, moves, illegalFlag) */
+/**
+ * 单局：
+ *  - [humanSeat] 在 0..3 时，该座位用普通模式 [AIDecision] 当「真实人类」代理；
+ *  - 其余座位用 [MasterSearch] 决策，并对 [humanSeat] 开启人类建模（[humanWeight]）。
+ *  - [humanSeat] 为 -1 时四家均用大师搜索（全大师基线，与历史行为一致）。
+ * 返回 (winner, moves, illegalFlag)
+ */
 private fun playGame(
     seed: Long,
     deadlineMs: Long,
     nodeLimit: Int,
     ctrlW: Int,
     ctrlWBase: Int?,
-    treatSeats: Set<Int>
+    treatSeats: Set<Int>,
+    humanSeat: Int,
+    humanWeight: Double
 ): Triple<Int, Int, Boolean> {
     val hands = deal(seed)
     var cur = 0
@@ -94,6 +124,7 @@ private fun playGame(
     var passes = 0
     var moves = 0
     var illegal = false
+    val played = mutableSetOf<Int>()   // 已出过的牌 id（用于给人类代理构造有限信息 unseenCounts）
 
     while (true) {
         val hand = hands[cur]
@@ -101,17 +132,26 @@ private fun playGame(
 
         // 非对称调参：治疗组座位用 CTRL_W，基线组用 CTRL_W_BASE（未设则全部同用 CTRL_W）
         val w = if (ctrlWBase != null && cur !in treatSeats) ctrlWBase else ctrlW
-        val decision = MasterSearch.solve(
-            hands = hands.mapIndexed { i, h -> i to h.toList() }.toMap(),
-            myIndex = cur,
-            topGroup = top,
-            topPlayer = topPlayer,
-            passes = passes,
-            current = cur,
-            deadlineMs = deadlineMs,
-            nodeLimit = nodeLimit,
-            ctrlWeight = w
-        )
+
+        // 人类建模实验：指定的「人类座位」用 AIDecision 当真实对手；其余座位开启 modelHuman。
+        val useProxy = humanSeat in 0..3 && cur == humanSeat
+        val decision = if (useProxy) {
+            aiDecideForSim(hands, cur, top, played)
+        } else {
+            MasterSearch.solve(
+                hands = hands.mapIndexed { i, h -> i to h.toList() }.toMap(),
+                myIndex = cur,
+                topGroup = top,
+                topPlayer = topPlayer,
+                passes = passes,
+                current = cur,
+                deadlineMs = deadlineMs,
+                nodeLimit = nodeLimit,
+                ctrlWeight = w,
+                humanModelWeight = if (useProxy) 0.0 else humanWeight,
+                humanModelSeat = if (useProxy) -1 else humanSeat
+            )
+        }
         val legal = CardRuleEngine.findAllValidPlays(hand, top)
         val passAllowed = top != null
         val ok = if (decision == null) passAllowed
@@ -127,6 +167,7 @@ private fun playGame(
                 cur = (cur + 1) % 4
             }
         } else {
+            for (c in decision.cards) played.add(c.id)
             hand.removeAll(decision.cards)
             if (hand.isEmpty()) return Triple(cur, moves, illegal)
             top = decision; topPlayer = cur; passes = 0; cur = (cur + 1) % 4
@@ -134,4 +175,39 @@ private fun playGame(
         moves++
         if (moves > 2000) return Triple(-1, moves, illegal)  // 异常保护
     }
+}
+
+/** 仿真中把某座位当普通模式 [AIDecision] 代理（人类建模里的「真实人类」一方）
+ *  [playedIds] 为已出过的牌 id 集合，用于让代理只掌握有限信息（自己手牌 + 已出牌），
+ *  而非完美信息全知——更贴近真实人类，使「建模人类」的实验结论可信。 */
+private fun aiDecideForSim(
+    hands: Array<MutableList<Card>>,
+    cur: Int,
+    top: CardGroup?,
+    playedIds: Set<Int>
+): CardGroup? {
+    val hand = hands[cur]
+    val oppCounts = IntArray(3)
+    val own = IntArray(16)
+    for (c in hand) own[c.rank]++
+    val playedCnt = IntArray(16)
+    for (id in playedIds) playedCnt[ID_TO_RANK_SIM[id] ?: 0]++
+    // 未见张数 = 各点数总数(4) − 自己手中 − 已出过
+    val unseen = IntArray(16)
+    for (r in 3..15) unseen[r] = 4 - own[r] - playedCnt[r]
+    var k = 0
+    for (i in 0..3) {
+        if (i == cur) continue
+        oppCounts[k++] = hands[i].size
+    }
+    val topBig = hands[(cur + 1) % 4].size == 1
+    val isGameStart = top == null && hands.all { it.size == 13 }
+    return AIDecision.decide(
+        hand = hand,
+        lastPlay = top,
+        opponentCardCounts = oppCounts,
+        unseenCounts = unseen,
+        requireDiamond3 = isGameStart,
+        mustTopBig = topBig
+    )
 }

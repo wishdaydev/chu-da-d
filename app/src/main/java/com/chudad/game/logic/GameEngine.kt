@@ -390,6 +390,7 @@ class GameEngine {
         if (stateMachine.phase != GamePhase.PLAYING) return
         if (stateMachine.currentPlayerIndex != 0) return
         if (stateMachine.mustPlay()) return   // 自由出牌 / 自己压自己时不能过
+        if (mustTopBigPlay(0)) return         // 顶大义务：能压必须出最大单张，不可过牌
 
         recordTopBigFailIfNeeded(0)
         processPass(0)
@@ -407,6 +408,14 @@ class GameEngine {
      */
     fun mustTopBig(playerIndex: Int): Boolean =
         players[(playerIndex + 1) % PLAYER_COUNT].cardCount == 1
+
+    /**
+     * 顶大强制出牌：下家报单（剩 1 张）、本轮为单张、且手中确有能压过它的单张
+     * → 该玩家「必须出最大的单张」，不得过牌。
+     * 这是比 [mustTopBig] 更硬的义务（mustTopBig 只约束「出单张时必须最大」，本函数约束「必须出」）。
+     */
+    fun mustTopBigPlay(playerIndex: Int): Boolean =
+        mustTopBig(playerIndex) && canTopBigWithSingle(playerIndex)
 
     /** 该玩家是否可「顶大」：桌面上是单张，且手中有能压过它的单张 */
     private fun canTopBigWithSingle(playerIndex: Int): Boolean {
@@ -575,6 +584,15 @@ class GameEngine {
             }
         }
 
+        // 顶大强制：下家报单且手中能压过桌面单张时，即使策略判「过牌」也必须出最大单张
+        if ((decision == null || decision.type == CardType.INVALID) && mustTopBigPlay(playerIndex)) {
+            val max = player.handCards
+                .maxWithOrNull(compareBy({ it.rank }, { it.suit.order }))
+            if (max != null) {
+                decision = CardGroup(CardType.SINGLE, max.rank, 1, listOf(max), max.suit.order)
+            }
+        }
+
         if (decision != null && decision.type != CardType.INVALID) {
             processPlay(playerIndex, decision.cards, decision)
             return
@@ -692,16 +710,22 @@ class GameEngine {
 
         if (decision != null && decision.type != CardType.INVALID) return decision.cards
 
-        // 自由出牌（无上一手）且启发式未给决策时，兜底提示最小单张；
-        // 跟牌情境下若启发式判定「过牌」更优（decision==null），则尊重该判断，提示「不出」。
-        if (lastPlay == null) {
-            val card = if (mustTopBig(0)) {
-                hand.maxWithOrNull(compareBy({ it.rank }, { it.suit.order }))
-            } else {
-                hand.minWithOrNull(compareBy({ it.rank }, { it.suit.order }))
-            }
-            if (card != null) return listOf(card)
+        // 兜底：策略判定「过牌 / 无解」时，只要手中仍有合法走法，就提示「最小可打的牌型」——
+        // 需要时拆散对子/三条、甚至动用 2 也在所不惜，避免明明能出却提示「没有能出的牌」。
+        // 仅当确实一手都出不了（findAllValidPlays 为空）才返回 null。
+        val legal = CardRuleEngine.findAllValidPlays(hand, lastPlay)
+        if (legal.isEmpty()) return null
+
+        // 顶大义务下必须给出「最大单张」（能压的情况下），与引擎强制出牌规则一致
+        if (mustTopBigPlay(0)) {
+            val maxSingle = legal.filter { it.type == CardType.SINGLE }
+                .maxByOrNull { it.mainRank * 16 + it.topSuitOrder }
+            if (maxSingle != null) return maxSingle.cards
         }
-        return null
+        // 否则取「最小可打」：主体点数最小、其次花色最小（同张数/同型内比较）
+        val pick = legal.minWithOrNull(
+            compareBy<CardGroup> { it.mainRank }.thenBy { it.topSuitOrder }
+        )
+        return pick?.cards
     }
 }

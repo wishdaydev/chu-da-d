@@ -21,7 +21,9 @@ import com.chudad.game.model.Suit
  *
  * 评估（非终局截断处）：以「手数竞速」为核心——
  *   每家的 [minPlays]（把手牌拆成最少合法牌组数）越小越接近出完；
- *   用 (对手最小手数 − 我的手数) 与 (对手最小张数 − 我的张数) 合成从我视角的值。
+ *   用 (对手最小手数 − 我的手数) 与 (对手最小张数 − 我的张数) 合成从我视角的值；
+ *   并叠加「控制权项」（Level 1 + 2）：静态手牌强度（2 / 同花顺 / 四带一）+ 当前出牌权
+ *   （自由领出 / 跟牌且能压制夺取领出权），对手取最坏者，用于缓解联盟建模导致的过度防御。
  *
  * 走法生成直接复用 [CardRuleEngine.findAllValidPlays]（含同花顺/四带一/葫芦/同花五等完整牌型，
  * 不裁剪候选集），保证搜索不会因候选集受限而漏掉最优解。
@@ -42,6 +44,19 @@ internal object MasterSearch {
     /** 手数竞速评估中各分量的权重（值需落在 (-WIN/2, WIN/2) 内，避免淹没终局值） */
     private const val W_PLAYS = 600
     private const val W_CARDS = 60
+
+    /**
+     * 控制权项权重（Level 1 + 2）。用来缓解 me-vs-field 联盟建模导致的「过度防御」：
+     * 让 AI 认识到「我握有 2 / 同花顺 / 四带一、当前掌控出牌权」时其实很强，不必盲目拆大牌去减手数。
+     * 其值需使控制权差（myCtrl − 最坏对手 oppCtrl）最大约 ±3000~5000，作为手数竞速的次级引导，
+     * 不淹没主项也不被主项完全覆盖。单张 2 贡献 CTRL_TWO×W_CTRL = 600，约等于一手之差。
+     */
+    private const val W_CTRL = 15
+    private const val LEAD_RIGHT_BONUS = 50      // 自由领出（top==null 且轮到我）：直接掌控节奏
+    private const val SEIZE_BONUS = 40          // 跟牌且我能压制领出方、夺取出牌权
+    private const val CTRL_TWO = 40             // 每张 2 的控场资本（任何牌型都最大、绝对不可压）
+    private const val CTRL_STRAIGHT_FLUSH = 30  // 同花顺（顶级牌型）
+    private const val CTRL_FOUR_WITH_ONE = 25   // 四带一（顶级牌型）
 
     /** A-2-3-4-5：A 作 1 时的最小顺子（点数序列，14=A、15=2） */
     private val A2345 = listOf(3, 4, 5, 14, 15)
@@ -392,8 +407,71 @@ internal object MasterSearch {
             oppPlays = minOf(oppPlays, minPlays(state.hands[i]))
             oppCards = minOf(oppCards, state.hands[i].size)
         }
-        val v = (oppPlays - myPlays) * W_PLAYS + (oppCards - myCards) * W_CARDS
+
+        // 控制权项（Level 1 + 2）：缓解 me-vs-field 联盟建模导致的过度防御。
+        // 静态手牌强度（仅依赖自己手牌，零跨玩家依赖）+ 当前出牌权（自由领出 / 跟牌且能压制夺取领出权）。
+        // 对手控制力取 max（最坏对手），与 oppPlays 取 min 的"最坏情况"语义一致。
+        // 当前出牌方能否压制由 findAllValidPlays 判定，整局评估仅调用一次（state.cur 恒为单一玩家）。
+        val curCanSeize = state.top != null &&
+            CardRuleEngine.findAllValidPlays(state.hands[state.cur], state.top).isNotEmpty()
+
+        val myCtrl = handStrength(state.hands[myIndex]) + currentPlayerBonus(state, myIndex, curCanSeize)
+        var oppCtrl = 0
+        for (i in 0..3) {
+            if (i == myIndex) continue
+            val c = handStrength(state.hands[i]) + currentPlayerBonus(state, i, curCanSeize)
+            oppCtrl = maxOf(oppCtrl, c)
+        }
+
+        val v = (oppPlays - myPlays) * W_PLAYS
+            + (oppCards - myCards) * W_CARDS
+            + (myCtrl - oppCtrl) * W_CTRL
         return v.coerceIn(-WIN / 2, WIN / 2)
+    }
+
+    /**
+     * 当前出牌者（[player]）是否握有出牌权：
+     * - 自由领出（[state.top]==null 且轮到他）→ 领出权加分；
+     * - 跟牌且能压制当前 top（[curCanSeize]）→ 夺取领出权加分。
+     * 非当前出牌者返回 0（出牌权在别人手里，无控制权增益）。
+     */
+    private fun currentPlayerBonus(state: State, player: Int, curCanSeize: Boolean): Int {
+        if (state.cur != player) return 0
+        return if (state.top == null) LEAD_RIGHT_BONUS else if (curCanSeize) SEIZE_BONUS else 0
+    }
+
+    /**
+     * 静态手牌控制力（仅依赖自己手牌，零跨玩家依赖）：
+     * - 每张 2（rank 15）在任何牌型都最大、绝对不可压 → 最强控场资本；
+     * - 同花顺 / 四带一为顶级牌型，压制力强。
+     * 用于 [evaluate] 的控制权项，缓解联盟建模造成的过度防御。
+     */
+    private fun handStrength(cards: List<Card>): Int {
+        var s = 0
+        for (c in cards) if (c.rank == 15) s += CTRL_TWO
+        if (hasStraightFlush(cards)) s += CTRL_STRAIGHT_FLUSH
+        if (hasFourWithOne(cards)) s += CTRL_FOUR_WITH_ONE
+        return s
+    }
+
+    /** 是否存在同花顺（同花色连续 5 张，或 A-2-3-4-5 同花） */
+    private fun hasStraightFlush(cards: List<Card>): Boolean {
+        for (s in 0..3) {
+            val ranks = cards.filter { it.suit.order == s }.map { it.rank }.toSet()
+            for (start in 3..10) {
+                if ((start..start + 4).all { it in ranks }) return true
+            }
+            if (A2345.all { it in ranks }) return true   // A-2-3-4-5（A 作 1）
+        }
+        return false
+    }
+
+    /** 是否存在四带一（任一点数 ≥ 4 张） */
+    private fun hasFourWithOne(cards: List<Card>): Boolean {
+        val cnt = IntArray(16)
+        for (c in cards) cnt[c.rank]++
+        for (r in 3..15) if (cnt[r] >= 4) return true
+        return false
     }
 
     /**

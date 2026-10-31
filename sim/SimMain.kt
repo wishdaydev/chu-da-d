@@ -32,7 +32,8 @@ import java.util.concurrent.atomic.AtomicLong
  *                        0~1=软建模（按权重补充弱人类候选），<=0=不建模（其余 3 座退化为全量展开做对照）。
  *   HEURISTIC_SEATS    = 哪些座位用启发式（默认：仅 HUMAN_MODEL_SEAT 指定的那一个）
  *   SELFISH_SEATS      = 哪些座位用 selfish 对手模型（默认全部；线上即为全部）
- *   OPP_TOPK / MAX_DEPTH = 对手模型保留候选数（默认 2）/ 迭代深度上限（默认线上 64）
+ *   OPP_TOPK           = 对手模型保留候选数（默认 2）
+ *   MAX_DEPTH          = 迭代深度上限（默认「自动」：按剩余牌数推导，等同线上；压到 8~12 可做浅搜索对照）
  *
  * 典型用法：
  *   全大师基线:            HUMAN_MODEL_SEAT=-1
@@ -46,7 +47,9 @@ private val ID_TO_RANK_SIM = createDeck().associate { it.id to it.rank }
 fun main(args: Array<String>) {
     val games = args.getOrNull(0)?.toIntOrNull() ?: 200
     val deadlineMs = args.getOrNull(1)?.toLongOrNull() ?: 50L
-    val nodeLimit = args.getOrNull(2)?.toIntOrNull() ?: 150_000
+    // 节点上限：不传（或传 0）＝不限，与线上同档（600 万只是安全阀）；
+    // 要做「固定节点预算」的确定性 A/B 时按需显式传入，如 SIM_NODES=120000
+    val nodeLimit = args.getOrNull(2)?.toIntOrNull()?.takeIf { it > 0 } ?: MasterSearch.ONLINE_NODE_LIMIT
     val threads = (args.getOrNull(3)?.toIntOrNull() ?: 1).coerceAtLeast(1)
     val baseSeed = args.getOrNull(4)?.toLongOrNull() ?: 1L
 
@@ -65,7 +68,7 @@ fun main(args: Array<String>) {
     val oppModelName = System.getenv("OPP_MODEL") ?: "selfish"
     val oppModel = if (oppModelName == "selfish") 1 else 0
     val oppTopK = System.getenv("OPP_TOPK")?.toIntOrNull() ?: 2
-    // 迭代加深深度上限：不设＝MasterSearch 线上默认（64，实质由时间截断）；
+    // 迭代加深深度上限：不设＝MasterSearch 线上默认（按剩余牌数自动推导，保证不会早于终局截断）；
     // 压到 8~12 可做「浅搜索」对照，验证深度对结论的影响
     val maxDepth = System.getenv("MAX_DEPTH")?.toIntOrNull()
     // 按座位指定谁用 selfish：用于「混合对局」量化模型优势（不设则 OPP_MODEL 全局生效）
@@ -78,7 +81,7 @@ fun main(args: Array<String>) {
             "nodeLimit=$nodeLimit threads=$threads baseSeed=$baseSeed " +
             "HUMAN_MODEL_SEAT=$humanSeat HUMAN_MODEL_WEIGHT=$humanWeight " +
             "HEURISTIC_SEATS=$heuristicSeats SELFISH_SEATS=$selfishSeats K=$oppTopK " +
-            "MAX_DEPTH=${maxDepth ?: 64}"
+            "MAX_DEPTH=${maxDepth ?: "自动"}"
     )
 
     val wins = IntArray(4)

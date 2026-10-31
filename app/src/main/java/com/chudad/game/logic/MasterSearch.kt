@@ -39,18 +39,38 @@ internal object MasterSearch {
     private const val INF = 2_000_000          // alpha-beta 初始边界
 
     /**
-     * 迭代加深深度上限的默认值。
+     * 迭代加深的深度上限由「牌局长度」自动推导，而不是拍一个固定常数。
      *
-     * 仅作「防止无意义递归」的安全阀——真正的停止条件必须是时间预算，
-     * 这样「最大思考时间(秒)」设置项才真正决定搜索强度。
-     * 实测：5 秒预算下 13 张开局局面也只能跑到 32 层左右（更深的层数会先撞时间墙），
-     * 故取 64 确保线上时间永远是唯一瓶颈、深度上限不会先行截断。
+     * 牌局本身是有限长的：一手出牌最多牵出 3 次过牌，即 1 张牌最多对应 [PLY_PER_CARD] 层；
+     * 于是「从当前局面到终局」的 ply 上界 = 剩余总牌数 × [PLY_PER_CARD]。
+     * 只要深度上限不小于这个上界，撞上限的那一层必然已经覆盖到终局（评估是精确胜负，
+     * 不是被截断的启发值），深度上限就不会在「还没算完」的时候偷走棋力。
+     *
+     * 因此它只是防递归过深的安全阀，时间/节点预算才是强度约束。
+     * 实测：5 秒预算下开局也只能跑到 33~37 层，离上界很远；残局牌少时上界自动收紧，
+     * 也不会因为「上限只有 64」而被平白截断。
      * 仿真可用 [solve] 的 maxDepth 参数单独覆盖（如压低到 8 层做快速对照）。
      */
-    private const val DEFAULT_MAX_DEPTH = 64
+    private const val PLY_PER_CARD = 4
 
-    /** 深度上限的硬边界：防止外部误传超大值导致递归过深（栈溢出） */
-    private const val MAX_DEPTH_CAP = 128
+    /**
+     * 深度上限的绝对硬顶（防失控递归）。
+     *
+     * 取 256 而不是 128：满场 52 张推导出的自然上界为 212 层，硬顶必须在其之上，
+     * 否则中后盘（实测 50ms 就能跑到 124 层）会被硬顶截断。
+     * 栈开销实测：1MB 栈可跑通 124 层且无溢出，线上搜索线程给 8MB，
+     * 212 层约需 1.7MB，余量约 4 倍。
+     */
+    private const val MAX_DEPTH_CAP = 256
+
+    /**
+     * 线上默认节点预算（安全阀，不是强度参数）。
+     *
+     * 实测参考：沙箱 5 秒约 227 万节点，手机同预算约为其 1/3~1/5；600 万 ≈ 沙箱 13 秒的量，
+     * 即默认 2~5 秒档远不会触及，只有把「最大思考时间」拉到 30 秒以上才可能先行截断。
+     * 保留它只为防止搜索失控，线上一律用 [GameEngine.masterDeadlineMs] 调强弱。
+     */
+    const val ONLINE_NODE_LIMIT = 6_000_000
 
     /** 手数竞速评估中各分量的权重（值需落在 (-WIN/2, WIN/2) 内，避免淹没终局值） */
     private const val W_PLAYS = 600
@@ -126,12 +146,21 @@ internal object MasterSearch {
      */
     private val lastNodesTL = ThreadLocal<Int>()
     private val lastDepthTL = ThreadLocal<Int>()
+    private val depthCappedTL = ThreadLocal<Boolean>()
 
     /** 最近一次 solve 的搜索节点数（未开始搜索时为 0） */
     val lastSearchNodes: Int get() = lastNodesTL.get() ?: 0
 
     /** 最近一次 solve 完整跑完的迭代深度（层 = ply，4 层约一圈） */
     val lastSearchDepth: Int get() = lastDepthTL.get() ?: 0
+
+    /**
+     * 最近一次 solve 是否跑满了深度上限（而非被时间/节点掐断）。
+     *
+     * 默认深度上限按剩余牌数推导，正常局面下时间先到、此值为 false；
+     * 残局牌少时上限自动收紧，为 true 即代表「该次搜索已经算到终局」，不是被截断。
+     */
+    val lastSearchDepthCapped: Boolean get() = depthCappedTL.get() ?: false
 
     /** 人类建模节点缓存条目：[aiMove] 为代理选中走法，[fullMoves] 为该局面全部合法走法（软建模用） */
     private class HumanNode(val aiMove: Move, val fullMoves: List<Move>)
@@ -282,9 +311,7 @@ internal object MasterSearch {
         // 先清零：本次若提前返回（无手牌/无走法），调用方读到的必须是 0 而不是上一次的残留值
         lastNodesTL.set(0)
         lastDepthTL.set(0)
-        // 深度上限：默认放开到 DEFAULT_MAX_DEPTH，使时间预算成为唯一瓶颈；
-        // 仿真可用该参数压低深度做「浅搜索」对照
-        val depthCap = (maxDepth ?: DEFAULT_MAX_DEPTH).coerceIn(1, MAX_DEPTH_CAP)
+        depthCappedTL.set(false)
         val myHand = hands[myIndex] ?: return null
         if (myHand.isEmpty()) return null
 
@@ -304,6 +331,12 @@ internal object MasterSearch {
         if (rawMoves.isEmpty()) return null   // 不应发生：自由出牌必有走法
         // 流程性约束先落到根走法集上，使搜索结果本身就是合法的一手
         val rootMoves = applyRootConstraints(rawMoves, myHand, mustContainDiamond3, mustTopBig)
+
+        // 深度上限：默认按「剩余牌数能撑出的最长牌局」推导，保证上限不会早于终局生效；
+        // 仿真仍可用 maxDepth 显式压低做「浅搜索」对照。
+        val remainingCards = state.hands.sumOf { it.size }
+        val naturalDepth = remainingCards * PLY_PER_CARD + PLY_PER_CARD
+        val depthCap = (maxDepth ?: naturalDepth).coerceIn(1, MAX_DEPTH_CAP)
 
         val deadline = System.currentTimeMillis() + deadlineMs
         val counter = longArrayOf(0L)
@@ -358,6 +391,8 @@ internal object MasterSearch {
         humanNodeCacheTL.remove()
         lastNodesTL.set(counter[0].toInt())
         lastDepthTL.set(completedDepth)
+        // 跑满 depthCap 说明不是被时间/节点掐断的（残局时即「已算到终局」）
+        depthCappedTL.set(completedDepth >= depthCap)
         return when (val m = bestMove) {
             is Move.Play -> m.group
             is Move.Pass -> null

@@ -37,7 +37,9 @@ object PerfBench {
         val nodes: Int,
         val depth: Int,
         val elapsedMs: Long,
-        val move: String
+        val move: String,
+        /** 是否跑满深度上限（正常开局恒为 false：时间先到） */
+        val depthCapped: Boolean = false
     )
 
     /** 汇总报表 */
@@ -89,6 +91,11 @@ object PerfBench {
             sb.append(String.format("平均深度 %.1f 层（1 层=一手，4 层≈一圈）\n", avgDepth))
             sb.append(String.format("平均耗时 %.0fms\n", avgElapsedMs))
             sb.append(String.format("搜索速率 %.0f 节点/ms（每万节点 ≈ %.1fms）\n", nodesPerMs, msPer10kNodes))
+            val capped = samples.count { it.depthCapped }
+            sb.append(
+                if (capped == 0) "深度上限：未触及（时间先到，时间预算是唯一瓶颈）\n"
+                else "深度上限：$capped/${samples.size} 组跑满（这些组已算到终局）\n"
+            )
             return sb.toString()
         }
     }
@@ -127,7 +134,8 @@ object PerfBench {
                     nodes = MasterSearch.lastSearchNodes,
                     depth = MasterSearch.lastSearchDepth,
                     elapsedMs = ms,
-                    move = describe(g)
+                    move = describe(g),
+                    depthCapped = MasterSearch.lastSearchDepthCapped
                 )
             )
             onProgress?.invoke(i, n)
@@ -145,7 +153,8 @@ object PerfBench {
             passes = 0,
             current = 0,
             deadlineMs = budgetMs,
-            nodeLimit = Int.MAX_VALUE,
+            // 与线上同档：600 万节点只是安全阀，基准测的是「预算内能搜多少」，不应被节点先掐断
+            nodeLimit = MasterSearch.ONLINE_NODE_LIMIT,
             mustContainDiamond3 = true,
             humanModelSeat = -1,
             humanModelWeight = 0.0

@@ -532,7 +532,8 @@ class MainActivity : AppCompatActivity(), GameEngineCallback {
             .setCancelable(false)
             .create()
         progress.show()
-        thread(name = "perf-bench") {
+        // 显式 8MB 栈：搜索深度上限已按牌数放开（最高 128 层），默认 1MB 在极端残局有溢出风险
+        Thread(null, {
             val report = try {
                 PerfBench.run(budget)
             } catch (t: Throwable) {
@@ -547,7 +548,7 @@ class MainActivity : AppCompatActivity(), GameEngineCallback {
                     showPerfResult(report)
                 }
             }
-        }
+        }, "perf-bench", 8L * 1024 * 1024).start()
     }
 
     /** 结果弹窗：等宽字体 + 可选中 + 一键复制（数字列必须对齐，方便逐行比对） */

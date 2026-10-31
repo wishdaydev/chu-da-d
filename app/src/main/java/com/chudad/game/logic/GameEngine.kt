@@ -154,7 +154,7 @@ class GameEngine {
         }
     }
 
-    /** 把牌列表按「牌组聚类 + 从大到小」原地重排：同花大顺→炸弹→同花→顺子→三条→对子→单张，
+    /** 把牌列表按「牌组聚类 + 从大到小」原地重排：同花大顺→四带一→葫芦→同花→顺子→三条→对子→单张，
      *  组内按牌型强度升序（单张最左、同花大顺最右），同强度按点数升序（大点数在右），
      *  同点数再按组内最大花色降序（♠ 在最右）。与人类手牌展示规则完全一致。 */
     private fun clusterSort(cards: MutableList<Card>) {
@@ -163,17 +163,20 @@ class GameEngine {
 
         // 1. 同花大顺（最强，level 7）
         extractStraights(remaining, groups, straightFlush = true, level = 7)
-        // 2. 炸弹（四张同点，level 6）
-        extractByRankCount(remaining, groups, 4, 6)
-        // 3. 同花（level 4，强于顺子，须在顺子之前抽取）
+        // 2. 四带一（level 6，主牌取最大四条，配牌取不拆其它 5 张牌组的最小单张）
+        extractFourWithOne(remaining, groups)
+        // 3. 葫芦（level 5，主牌取最大三条，配牌取不拆其它 5 张牌组的最小对子；
+        //    强于同花，须在同花/顺子之前抽取）
+        extractFullHouse(remaining, groups)
+        // 4. 同花（level 4，强于顺子，须在顺子之前抽取）
         extractFlushes(remaining, groups)
-        // 4. 顺子（level 3）
+        // 5. 顺子（level 3）
         extractStraights(remaining, groups, straightFlush = false, level = 3)
-        // 5. 三条（level 2）
+        // 6. 三条（level 2）
         extractByRankCount(remaining, groups, 3, 2)
-        // 6. 对子（level 1）
+        // 7. 对子（level 1）
         extractByRankCount(remaining, groups, 2, 1)
-        // 7. 剩余单张（level 0）
+        // 8. 剩余单张（level 0）
         for (c in remaining) groups.add(ComboGroup(0, c.rank, listOf(c)))
 
         // 排序：先按牌型强度升序（单张最左、同花大顺最右），
@@ -222,6 +225,84 @@ class GameEngine {
                 remaining.removeAll(taken)
             }
         }
+    }
+
+    /**
+     * 四带一（炸弹，level 6）：主牌取「点数最大」的四条；配牌（1 张）取「不拆散其它 5 张牌组」的
+     * 最小单张——优先选不属于任何顺子/同花/同花顺候选的牌，其次点数最小、花色最大，
+     * 使四带一尽量不破坏更强牌型。
+     */
+    private fun extractFourWithOne(remaining: MutableList<Card>, groups: MutableList<ComboGroup>) {
+        val byRank = remaining.groupBy { it.rank }
+        val fourEntry = byRank.entries.filter { it.value.size >= 4 }.maxByOrNull { it.key } ?: return
+        val fourCards = fourEntry.value.sortedByDescending { it.suit.order }.take(4)
+
+        val others = remaining.filter { it.rank != fourEntry.key }
+        if (others.isEmpty()) return   // 无配牌则不组四带一（四条留待后续单独成组）
+        // 在主牌之外判断「其它 5 张牌组」，避免主牌自身的同花/顺子贡献干扰配牌选择
+        val inFive = cardsInFiveCardCombos(others)
+        // 优先：不在其它 5 张牌型候选中（不拆散更强牌组）；其次：点数最小、花色最大
+        val kicker = others.minWithOrNull(
+            compareBy<Card> { c -> if (c in inFive) 1 else 0 }
+                .thenBy { c -> c.rank }
+                .thenByDescending { c -> c.suit.order }
+        ) ?: return
+        val combo = fourCards + kicker
+        groups.add(ComboGroup(6, fourEntry.key, combo))
+        remaining.removeAll(combo)
+    }
+
+    /**
+     * 葫芦（三带二，level 5）：主牌取「点数最大」的三条；配牌（对子）取「不拆散其它 5 张牌组」的
+     * 最小对子——优先选两张都不属于任何顺子/同花/同花顺候选的对子，其次点数最小。
+     * 若没有可配的对子，则不组葫芦（三条留给后续单独成组）。
+     */
+    private fun extractFullHouse(remaining: MutableList<Card>, groups: MutableList<ComboGroup>) {
+        val byRank = remaining.groupBy { it.rank }
+        val tripleEntry = byRank.entries.filter { it.value.size >= 3 }.maxByOrNull { it.key } ?: return
+        val tripleCards = tripleEntry.value.sortedByDescending { it.suit.order }.take(3)
+
+        val pairCandidates = byRank.entries.filter { it.key != tripleEntry.key && it.value.size >= 2 }
+        if (pairCandidates.isEmpty()) return   // 没有可配对子 → 不组葫芦
+
+        // 在主牌之外判断「其它 5 张牌组」，避免主牌自身的同花/顺子贡献干扰配牌选择
+        val inFive = cardsInFiveCardCombos(remaining - tripleCards)
+        // 候选对子的两张都不在其它 5 张牌组候选中 → 优先（值 0）；否则值 1；同档再比点数最小
+        val pairEntry = pairCandidates.minWithOrNull(
+            compareBy<Map.Entry<Int, List<Card>>> { e ->
+                if (e.value.take(2).any { it in inFive }) 1 else 0
+            }.thenBy { e -> e.key }
+        ) ?: return
+        val pairCards = pairEntry.value.sortedByDescending { it.suit.order }.take(2)
+
+        val combo = tripleCards + pairCards
+        groups.add(ComboGroup(5, tripleEntry.key, combo))
+        remaining.removeAll(combo)
+    }
+
+    /**
+     * 返回 [cards] 中「可参与组成 5 张牌型（顺子/同花/同花顺）」的牌集合：
+     * - 某花色 ≥5 张 → 这些同花色牌都算（任意 5 张即可组成同花）；
+     * - 某连续 5 点段各点数至少有一张（含 A-2-3-4-5 轮式）→ 这些牌都算。
+     * 用于葫芦/四带一配牌选择时「尽量不拆散其它 5 张牌组」。
+     */
+    private fun cardsInFiveCardCombos(cards: List<Card>): Set<Card> {
+        val result = mutableSetOf<Card>()
+        // 同花 / 同花顺：每个花色 ≥5 张即全部计入（任意 5 张组成同花）
+        for (s in Suit.values()) {
+            val suited = cards.filter { it.suit == s }
+            if (suited.size >= 5) result.addAll(suited)
+        }
+        // 顺子 / 同花顺：连续 5 点段（2 仅作 A-2-3-4-5 轮式，不进普通顺子）
+        val rankSet = cards.map { it.rank }.toSet()
+        for (start in 10 downTo 3) {
+            val seq = (start..start + 4)
+            if (seq.all { it in rankSet }) result.addAll(cards.filter { it.rank in seq })
+        }
+        // A-2-3-4-5 轮式（A=14, 2=15）
+        val wheel = listOf(3, 4, 5, 14, 15)
+        if (wheel.all { it in rankSet }) result.addAll(cards.filter { it.rank in wheel })
+        return result
     }
 
     /** 同花：同花色 >=5 张，取点数最大的 5 张作为一个牌组（level 4）。

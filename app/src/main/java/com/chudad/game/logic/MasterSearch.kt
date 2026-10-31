@@ -79,9 +79,21 @@ internal object MasterSearch {
     private val minPlaysCache = java.util.concurrent.ConcurrentHashMap<Long, Int>()
 
     /**
-     * 缓存容量上限：满即整体清空。
-     * 缓存键是 52 位手牌掩码，长对战（多局 × 每局上千节点）会持续累积，
-     * 不加限制将成为无界内存增长。
+     * 清空手数评估缓存，由 [GameEngine.startNewGame] 在每局发牌前调用。
+     *
+     * 缓存键是「某玩家当前手牌集合」的 52 位掩码，而新一局发牌完全不同，
+     * 旧局的条目对新局几乎零命中——留着只占内存。因此把清空时机固定在
+     * 局与局之间：既不丢任何有效条目（本局条目在下一局本就无用），
+     * 也避免容量上限在某一局中途触发清空、把该局已算好的命中全部丢掉。
+     */
+    fun clearCache() {
+        minPlaysCache.clear()
+    }
+
+    /**
+     * 缓存容量兜底上限：满即整体清空。
+     * 正常情况下每局条目数在千级，开局清空已足以控制内存；
+     * 此上限仅防止单局内出现极端枚举时的无界增长。
      */
     private const val MIN_PLAYS_CACHE_MAX = 20_000
 

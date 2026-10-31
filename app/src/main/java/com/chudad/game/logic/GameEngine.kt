@@ -103,6 +103,7 @@ class GameEngine {
     /** 开始新游戏：洗牌发牌（4 人各 13 张） */
     fun startNewGame() {
         searchEpoch++                       // 使在途的后台搜索结果作废
+        MasterSearch.clearCache()           // 手数缓存按手牌掩码索引，跨局零命中，开局即清
         players.forEach { it.handCards.clear() }
         playedByPlayer.forEach { it.fill(0) }
         selectedCardIndices.clear()

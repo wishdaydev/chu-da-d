@@ -31,6 +31,12 @@ object AIDecision {
     /** 2 的点数（最大牌，不可轻易动用） */
     private const val RANK_TWO = 15
 
+    /** 顺子固定长度（与 CardRuleEngine 一致） */
+    private const val STRAIGHT_LEN = 5
+
+    /** 首出打分中「出完该手后剩余手数」的权重（每多一手扣该值） */
+    private const val HAND_COST = 20
+
     /**
      * 决策入口
      * @param hand 我方手牌
@@ -100,6 +106,7 @@ object AIDecision {
      * 首出打分（越大越优先）：
      *  - 多出牌加分（尽快消耗手牌）
      *  - 主牌点数越小越优先（保存大牌后手）
+     *  - 出完该手后「剩余手数」越少越好（避免为多出一张而拆散能一次走完的结构）
      *  - 动用 2 / 重牌 重罚；同花五作为五张中层牌型轻罚
      *  - 已「未见最大」的单牌额外加分（出出去无人能压，稳赚一手）
      */
@@ -116,10 +123,41 @@ object AIDecision {
         // 拆散牌型结构的惩罚（拆对子/三条/四条）
         s -= breakPenalty(g, hand)
 
+        // 出完这手后剩余手数：只看本手出牌量会被「多出一张」骗到，
+        // 例如 3,3,4,5,6,7,8 出顺子后剩两张散牌（3 手），出对子 33 后恰好剩一手顺子（2 手）。
+        s -= estimateHands(remainingHand(hand, g)) * HAND_COST
+
         // 单张且已是未见最大牌 → 稳定控场
         if (g.type == CardType.SINGLE && isTopUnseenSingle(g, unseenCounts)) s += 30
 
         return s
+    }
+
+    /** 出掉 [played] 之后剩余的手牌（按 id 排除） */
+    private fun remainingHand(hand: List<Card>, played: CardGroup): List<Card> {
+        val ids = played.cards.map { it.id }.toSet()
+        return hand.filter { it.id !in ids }
+    }
+
+    /**
+     * 剩余手牌的最小手数估算（贪心下界）：
+     *  - 同点数 ≥2 张合并为 1 手（对子/三条/四条）
+     *  - 散牌中每凑成一个 5 连顺子，5 手并成 1 手
+     * 不计 A-2-3-4-5 与同花类牌型，属保守估算，只用于比较不同出牌的相对优劣。
+     */
+    private fun estimateHands(cards: List<Card>): Int {
+        if (cards.isEmpty()) return 0
+        val byRank = cards.groupingBy { it.rank }.eachCount()
+        var hands = byRank.size
+        val singles = byRank.filterValues { it == 1 }.keys.sorted()
+        var i = 0
+        while (i < singles.size) {
+            var j = i
+            while (j + 1 < singles.size && singles[j + 1] == singles[j] + 1) j++
+            hands -= ((j - i + 1) / STRAIGHT_LEN) * (STRAIGHT_LEN - 1)
+            i = j + 1
+        }
+        return hands
     }
 
     /** 该单张是否已是「未见牌中最大的」：更高点数已全部现出 */
@@ -168,11 +206,13 @@ object AIDecision {
      *  - 同张数下跨牌型时按牌型层级加价（能出顺子就不出葫芦，保留更强牌型）
      *  - 主体点数为 2 重罚
      *  - 拆散对子/三条/四条结构有额外惩罚
+     *  - 出完该手后剩余手数越少越优先（与首出同一口径）
      */
     private fun cost(g: CardGroup, hand: List<Card>): Int {
         var c = g.mainRank * 2 + typeSurcharge(g.type)
         if (g.mainRank == RANK_TWO) c += 30
         c += breakPenalty(g, hand)
+        c += estimateHands(remainingHand(hand, g)) * HAND_COST / 2
         return c
     }
 

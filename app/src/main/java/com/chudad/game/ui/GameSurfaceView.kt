@@ -510,6 +510,13 @@ class GameSurfaceView(context: Context) : SurfaceView(context), SurfaceHolder.Ca
     private var animTime = 0L
     /** 平滑缓动：当前值向目标值过渡（选中牌上浮等） */
     private val liftValues = FloatArray(40)
+
+    /** 人类出牌后手牌重新聚类排序的 0.6s 横向位移动画状态 */
+    private var handResortStart = 0L                                   // 0 = 未在播放
+    private val handResortFrom = mutableMapOf<Int, Float>()            // card.id → 动画起点 x（上一帧渲染位置）
+    private val handDisplayX = mutableMapOf<Int, Float>()              // card.id → 最近一帧实际绘制 x（供下一轮动画取起点）
+    private val HAND_RESORT_DUR_MS = 600L                             // 重排动画时长
+    private val HAND_RESORT_HOP = 16f                                 // 滑动中轻微上抬（像素），落定时归零，让重排更显眼自然
     /** 桌面出牌入场动画起始时间（按玩家槽位，4 人局） */
     private val playAnimStart = LongArray(4)
     /** 桌面出牌落桌入场动画结束时间（用于精准判断动画是否仍在进行，避免 PLAYING 停帧误杀） */
@@ -1845,7 +1852,15 @@ class GameSurfaceView(context: Context) : SurfaceView(context), SurfaceHolder.Ca
         return 1f + x * x * x
     }
 
-    /** 底部人类手牌（间距最多填满95%宽度，开局有 3 秒逐张滑入动画） */
+    /** 人类出牌后手牌重新聚类排序：启动 0.6s 横向位移动画（旧位置→新聚类位置，带轻微上抬回落） */
+    fun startHandResort() {
+        if (!::gameEngine.isInitialized) return
+        handResortFrom.clear()
+        handResortFrom.putAll(handDisplayX)   // 上一帧的渲染位置即为动画起点
+        handResortStart = System.currentTimeMillis()
+    }
+
+    /** 底部人类手牌（间距最多填满95%宽度，开局有 3 秒逐张滑入动画；出牌后按聚类重排并带 0.6s 滑动动画） */
     private fun drawHumanHand(canvas: Canvas) {
         val hand = gameEngine.players[0].handCards
         if (hand.isEmpty()) return
@@ -1858,9 +1873,22 @@ class GameSurfaceView(context: Context) : SurfaceView(context), SurfaceHolder.Ca
         val now = System.currentTimeMillis()
         val elapsed = if (isHandReveal) now - dealRevealStart else Long.MAX_VALUE
 
+        // 重排动画进度（全手牌共享同一进度，保证整齐滑动）
+        val resorting = handResortStart > 0L
+        val rp = if (resorting) ((now - handResortStart).toFloat() / HAND_RESORT_DUR_MS).coerceIn(0f, 1f) else 0f
+        val re = if (resorting) easeOutCubic(rp) else 0f
+
         for ((i, card) in hand.withIndex()) {
             val isSelected = i in gameEngine.selectedCardIndices
-            val cx = startX + i * handSpacing
+            val targetX = startX + i * handSpacing
+            // 重排动画：从上一帧位置缓动到新的聚类位置；非动画态直接落位
+            val cx = if (resorting) {
+                val from = handResortFrom[card.id] ?: targetX
+                from + (targetX - from) * re
+            } else {
+                targetX
+            }
+            handDisplayX[card.id] = cx   // 记录本帧实际 x，供下一轮动画取起点
 
             // 微弧效果
             val distFromCenter = i - centerIdx
@@ -1884,6 +1912,8 @@ class GameSurfaceView(context: Context) : SurfaceView(context), SurfaceHolder.Ca
             var scale = 1f
             // 选中牌轻微放大
             if (!isHandReveal && lift > 1f) scale = 1f + 0.03f * (lift / 60f)
+            // 重排滑动过程中的轻微上抬（sin 抛物线，落定时归零），让移动更显眼自然
+            if (resorting) cy -= sin(rp * PI.toFloat()) * HAND_RESORT_HOP
 
             if (isHandReveal) {
                 val p = ((elapsed - i * REVEAL_STAGGER_MS).toFloat() / REVEAL_DUR_MS).coerceIn(0f, 1f)
@@ -1896,6 +1926,8 @@ class GameSurfaceView(context: Context) : SurfaceView(context), SurfaceHolder.Ca
 
             drawRevealingCard(canvas, cx, cy, card, isSelected, rotation, scale, alpha)
         }
+
+        if (resorting && now - handResortStart >= HAND_RESORT_DUR_MS) handResortStart = 0L
 
         if (isHandReveal && elapsed >= revealTotalMs(hand.size)) {
             finishReveal()
@@ -2128,21 +2160,21 @@ class GameSurfaceView(context: Context) : SurfaceView(context), SurfaceHolder.Ca
         // 4 人局：屏宽扣掉两侧边距与两条缝隙后三等分，左/中/右各一条牌带，互不重叠
         val bandW = (screenWidth - margin * 2f - centerGap * 2f) / 3f
 
-        // 顶部左AI（电脑A）剩余牌：贴左边缘起排
+        // 顶部左AI（电脑A）剩余牌：贴左边缘起排（按人类手牌的聚类+从大到小规则呈现）
         drawRemainingRow(
-            canvas, gameEngine.players[1].handCards,
+            canvas, gameEngine.getGroupedHand(1),
             bandLeft = margin, bandRight = margin + bandW,
             backY, miniW, miniH, miniGap, "电脑A剩余", leftAlign = true
         )
         // 顶部中AI（电脑B）剩余牌：中间牌带内排布
         drawRemainingRow(
-            canvas, gameEngine.players[2].handCards,
+            canvas, gameEngine.getGroupedHand(2),
             bandLeft = margin + bandW + centerGap, bandRight = margin + bandW * 2f + centerGap,
             backY, miniW, miniH, miniGap, "电脑B剩余", leftAlign = true
         )
         // 顶部右AI（电脑C）剩余牌：贴右边缘排布，向左延伸到本条牌带左缘为止
         drawRemainingRow(
-            canvas, gameEngine.players[3].handCards,
+            canvas, gameEngine.getGroupedHand(3),
             bandLeft = margin + (bandW + centerGap) * 2f, bandRight = screenWidth - margin,
             backY, miniW, miniH, miniGap, "电脑C剩余", leftAlign = false
         )

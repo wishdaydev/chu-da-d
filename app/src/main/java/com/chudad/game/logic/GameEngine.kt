@@ -146,10 +146,146 @@ class GameEngine {
         val deck = createDeck()
         deck.shuffle()
         deck.forEachIndexed { i, card -> players[i % PLAYER_COUNT].handCards.add(card) }
-        // 手牌排序：先按点数，再按花色，便于 UI 与 AI 稳定处理
-        players.forEach {
+        // 手牌排序：人类按「牌组」聚类展示（同点成束、束间按张数升序、单张在左、大束在右）；
+        // 其余三家不展示单牌，仅按点数排序便于稳定处理
+        sortHandByGroup(0)
+        players.filter { it.index != 0 }.forEach {
             it.handCards.sortWith(compareBy({ c: Card -> c.rank }, { c: Card -> c.suit.order }))
         }
+    }
+
+    /** 把牌列表按「牌组聚类 + 从大到小」原地重排：同花大顺→炸弹→同花→顺子→三条→对子→单张，
+     *  组内按牌型强度升序（单张最左、同花大顺最右），同强度按点数升序（大点数在右），
+     *  同点数再按组内最大花色降序（♠ 在最右）。与人类手牌展示规则完全一致。 */
+    private fun clusterSort(cards: MutableList<Card>) {
+        val remaining = cards.toMutableList()
+        val groups = mutableListOf<ComboGroup>()
+
+        // 1. 同花大顺（最强，level 7）
+        extractStraights(remaining, groups, straightFlush = true, level = 7)
+        // 2. 炸弹（四张同点，level 6）
+        extractByRankCount(remaining, groups, 4, 6)
+        // 3. 同花（level 4，强于顺子，须在顺子之前抽取）
+        extractFlushes(remaining, groups)
+        // 4. 顺子（level 3）
+        extractStraights(remaining, groups, straightFlush = false, level = 3)
+        // 5. 三条（level 2）
+        extractByRankCount(remaining, groups, 3, 2)
+        // 6. 对子（level 1）
+        extractByRankCount(remaining, groups, 2, 1)
+        // 7. 剩余单张（level 0）
+        for (c in remaining) groups.add(ComboGroup(0, c.rank, listOf(c)))
+
+        // 排序：先按牌型强度升序（单张最左、同花大顺最右），
+        // 同强度内按点数升序（大点数在右），同点数再按组内最大花色降序（♠ 在最右）
+        val ordered = groups
+            .sortedWith(
+                compareBy<ComboGroup> { it.level }
+                    .thenBy { it.mainRank }
+                    .thenByDescending { g -> g.cards.maxOf { it.suit.order } }
+            )
+            .flatMap { g -> g.cards.sortedWith(compareBy({ it.rank }, { it.suit.order })) }
+        cards.clear()
+        cards.addAll(ordered)
+    }
+
+    /** 仅人类手牌在游戏中需要聚类展示：发牌与出牌后调用，原地重排其 [handCards] */
+    private fun sortHandByGroup(playerIndex: Int) {
+        val p = players.getOrNull(playerIndex) ?: return
+        if (p.index != 0) return   // 仅人类手牌需要聚类展示
+        clusterSort(p.handCards)
+    }
+
+    /** 返回某玩家手牌按「牌组聚类 + 从大到小」排序后的拷贝（不改变原手牌顺序），供结算画面展示用 */
+    fun getGroupedHand(playerIndex: Int): List<Card> {
+        val copy = players.getOrNull(playerIndex)?.handCards?.toMutableList() ?: mutableListOf()
+        clusterSort(copy)
+        return copy
+    }
+
+    /** 一组被聚类出来的牌：level 为牌型强度（越大越强），mainRank 用于同强度内排序 */
+    private data class ComboGroup(val level: Int, val mainRank: Int, val cards: List<Card>)
+
+    /** 同点聚束：把出现次数 >= [count] 的牌点各取 [count] 张作为一个牌组（对子/三条/炸弹）。
+     *  按点数降序遍历（大牌优先成组），同点多张时优先取大花色（♠ 优先留在组内）。 */
+    private fun extractByRankCount(
+        remaining: MutableList<Card>,
+        groups: MutableList<ComboGroup>,
+        count: Int,
+        level: Int
+    ) {
+        val byRank = remaining.groupBy { it.rank }
+        for ((rank, cards) in byRank.entries.sortedByDescending { it.key }) {
+            if (cards.size >= count) {
+                val taken = cards.sortedByDescending { it.suit.order }.take(count)
+                groups.add(ComboGroup(level, rank, taken))
+                remaining.removeAll(taken)
+            }
+        }
+    }
+
+    /** 同花：同花色 >=5 张，取点数最大的 5 张作为一个牌组（level 4）。
+     *  大牌优先成组使同花组 mainRank 更大（展示更靠右），剩最小单张；花色按 order 降序（♠ 优先成组）。 */
+    private fun extractFlushes(remaining: MutableList<Card>, groups: MutableList<ComboGroup>) {
+        val bySuit = remaining.groupBy { it.suit }
+            .entries
+            .sortedByDescending { it.key.order }
+        for ((_, cards) in bySuit) {
+            if (cards.size >= 5) {
+                val taken = cards
+                    .sortedWith(compareByDescending<Card> { it.rank }.thenByDescending { it.suit.order })
+                    .take(5)
+                groups.add(ComboGroup(4, taken.maxOf { it.rank }, taken))
+                remaining.removeAll(taken)
+            }
+        }
+    }
+
+    /**
+     * 顺子 / 同花顺：从剩余牌中反复抽取 5 张连续的牌组成牌组。
+     * @param straightFlush true 时只抽「同花色」的连续五张（同花顺）；false 时抽任意花色的连续五张（顺子）。
+     */
+    private fun extractStraights(
+        remaining: MutableList<Card>,
+        groups: MutableList<ComboGroup>,
+        straightFlush: Boolean,
+        level: Int
+    ) {
+        while (true) {
+            val taken = if (straightFlush) {
+                // 同花顺：花色按 order 降序（♠ 最大优先成组）；同花色同点唯一，直接取
+                remaining.groupBy { it.suit }
+                    .entries
+                    .sortedByDescending { it.key.order }
+                    .map { it.value }
+                    .firstNotNullOfOrNull { cards ->
+                        val seq = findStraightRun(cards.map { it.rank }.toSet()) ?: return@firstNotNullOfOrNull null
+                        seq.map { r -> cards.first { it.rank == r } }
+                    }
+            } else {
+                val seq = findStraightRun(remaining.map { it.rank }.toSet()) ?: return
+                // 同点数多张时优先取最小花色（♦ 最小），把大花色（♠）留给同花组
+                seq.map { r -> remaining.filter { it.rank == r }.minByOrNull { it.suit.order }!! }
+            }
+            if (taken == null || taken.isEmpty()) return
+            groups.add(ComboGroup(level, taken.maxOf { it.rank }, taken))
+            remaining.removeAll(taken)
+        }
+    }
+
+    /**
+     * 在给定点数集合中找一段「连续五张」：从大点数窗口向小扫描（优先 4-8 而非 3-7），
+     * 使大点数的顺子优先成组、把小牌留给对子/三条；或特殊顺子 A-2-3-4-5。
+     * 返回所选手点（无序），找不到返回 null。
+     */
+    private fun findStraightRun(ranks: Set<Int>): List<Int>? {
+        for (start in 10 downTo 3) {
+            val seq = (start..start + 4)
+            if (seq.all { it in ranks }) return seq.toList()
+        }
+        val wheel = listOf(14, 15, 3, 4, 5)   // A-2-3-4-5（A=14, 2=15），仅在无更大普通顺时选用
+        if (wheel.all { it in ranks }) return wheel
+        return null
     }
 
     // ============================ 人类操作 ============================
@@ -235,6 +371,8 @@ class GameEngine {
 
         val nextPlayer = stateMachine.processPlay(playerIndex, group)
         selectedCardIndices.clear()
+        // 人类出牌后按「牌组」重新聚类排序（此时选择已清空，无索引错位）
+        if (playerIndex == 0) sortHandByGroup(0)
         callback?.onPlayerPlay(playerIndex, cards, group)
 
         // 先出完手牌者胜

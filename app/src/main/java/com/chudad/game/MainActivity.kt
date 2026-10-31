@@ -388,6 +388,7 @@ class MainActivity : AppCompatActivity(), GameEngineCallback {
 
     override fun onPlayerPlay(playerIndex: Int, cards: List<Card>, group: CardGroup) {
         runOnUiThread {
+            if (playerIndex == 0) gameSurfaceView.startHandResort()   // 人类出牌后手牌重新聚类：0.6s 重排动画
             gameSurfaceView.setTablePlayedCards(playerIndex, cards)
             // 四带一 / 同花顺 是锄大D 中的强力牌型，用重音效；其余用普通甩牌声
             val isStrong = group.type == CardType.FOUR_WITH_ONE ||

@@ -13,10 +13,12 @@ import androidx.appcompat.app.AppCompatActivity
 import androidx.core.view.WindowCompat
 import com.chudad.game.logic.GameEngine
 import com.chudad.game.logic.GameEngineCallback
+import com.chudad.game.logic.ScoreCalculator
 import com.chudad.game.model.Card
 import com.chudad.game.model.CardGroup
 import com.chudad.game.model.CardType
 import com.chudad.game.model.Difficulty
+import com.chudad.game.model.Suit
 import com.chudad.game.ui.GameSurfaceView
 import org.json.JSONObject
 import java.io.IOException
@@ -412,16 +414,35 @@ class MainActivity : AppCompatActivity(), GameEngineCallback {
     override fun onGameOver(winnerIndex: Int) {
         runOnUiThread {
             val isHumanWin = winnerIndex == 0
-
-            // 锄大D 积分（剩余张数累计法）：
-            // 赢家收取其余各家剩余手牌数之和。人类赢 → 加「其余三家剩余张数之和」；
-            // 人类输 → 扣「自身剩余张数」（即应支付给赢家的牌数）。
-            // 积分采用剩余张数累计法（四带一/同花顺为正常牌型，不计额外倍数）。
             val playerCount = gameEngine.players.size
+
+            // 每家剩余张数、是否含黑桃2（阶梯计分 + 黑桃2翻倍）
             val remaining = IntArray(playerCount) { gameEngine.getCardCount(it) }
-            val humanRemaining = remaining[0]
-            val othersRemaining = (1 until playerCount).sumOf { remaining[it] }
-            val scoreDelta = if (isHumanWin) othersRemaining else -humanRemaining
+            val hasSpadeTwo = BooleanArray(playerCount) { i ->
+                gameEngine.players[i].handCards.any { it.rank == 15 && it.suit == Suit.SPADE }
+            }
+            val cardScores = IntArray(playerCount) { i ->
+                ScoreCalculator.scoreFor(remaining[i], hasSpadeTwo[i])
+            }
+
+            // 顶大失职：仅当报单者（失职者的下家）最终获胜时生效
+            val fail = gameEngine.topBigFailIndex
+            val penalized = if (fail in 0 until playerCount &&
+                winnerIndex == (fail + 1) % playerCount
+            ) fail else -1
+
+            // 四家得分变化（零和）：赢家收三家牌分；顶大失职者独自包赔三家
+            val scoreDelta = ScoreCalculator.settle(remaining, hasSpadeTwo, winnerIndex, fail)[0]
+
+            val anyDouble = (0 until playerCount).any {
+                cardScores[it] > ScoreCalculator.baseScore(remaining[it])
+            }
+            val tag = when {
+                penalized == 0 -> "顶大失职·包赔"
+                penalized > 0 -> "顶大失职·代付"
+                anyDouble -> "♠2 翻倍"
+                else -> "剩 ${if (isHumanWin) (1 until playerCount).sumOf { remaining[it] } else remaining[0]} 张"
+            }
 
             val mode = gameEngine.aiDifficulty
             val st = stats[mode]!!
@@ -432,7 +453,8 @@ class MainActivity : AppCompatActivity(), GameEngineCallback {
             gameSurfaceView.showSettlement(
                 isHumanWin,
                 scoreDelta = scoreDelta,
-                multiplierText = "剩 ${if (isHumanWin) othersRemaining else humanRemaining} 张"
+                multiplierText = tag,
+                forceShowScore = penalized > 0
             )
 
             st.games++

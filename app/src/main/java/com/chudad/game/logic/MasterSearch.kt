@@ -3,6 +3,7 @@ package com.chudad.game.logic
 import com.chudad.game.model.Card
 import com.chudad.game.model.CardGroup
 import com.chudad.game.model.CardType
+import com.chudad.game.model.Suit
 
 /**
  * 大师模式「4 人完美信息搜索」求解器（锄大D / Big Two）
@@ -22,18 +23,28 @@ import com.chudad.game.model.CardType
  *   每家的 [minPlays]（把手牌拆成最少合法牌组数）越小越接近出完；
  *   用 (对手最小手数 − 我的手数) 与 (对手最小张数 − 我的张数) 合成从我视角的值。
  *
- * 走法生成直接复用 [CardRuleEngine.findAllValidPlays]（含同花顺/葫芦/四带一等完整牌型，
+ * 走法生成直接复用 [CardRuleEngine.findAllValidPlays]（含同花顺/四带一/葫芦/同花五等完整牌型，
  * 不裁剪候选集），保证搜索不会因候选集受限而漏掉最优解。
  */
 internal object MasterSearch {
 
     private const val WIN = 1_000_000          // 终局胜负值（带 ply 偏移后仍在 ±WIN 内）
     private const val INF = 2_000_000          // alpha-beta 初始边界
-    private const val MAX_DEPTH = 9            // 迭代加深上限
+
+    /**
+     * 迭代加深深度上限。
+     * 仅作「防止无意义递归」的安全阀——真正的停止条件是时间/节点预算，
+     * 因此取值需远大于预算内实际可达深度（4 人局通常 5~12 层），
+     * 否则搜索会在预算耗尽前提前收敛，导致「最大思考时间」设置形同虚设。
+     */
+    private const val MAX_DEPTH = 32
 
     /** 手数竞速评估中各分量的权重（值需落在 (-WIN/2, WIN/2) 内，避免淹没终局值） */
     private const val W_PLAYS = 600
     private const val W_CARDS = 60
+
+    /** A-2-3-4-5：A 作 1 时的最小顺子（点数序列，14=A、15=2） */
+    private val A2345 = listOf(3, 4, 5, 14, 15)
 
     /** 单张牌的位掩码（id ∈ 0..51，适配 64 位） */
     private fun cardMask(card: Card): Long = 1L shl card.id
@@ -69,6 +80,12 @@ internal object MasterSearch {
 
     /**
      * 求解当前局面下 myIndex 的最优一手。
+     *
+     * @param mustContainDiamond3 本手是否必须包含方块 3（整场第一局首手）；为 true 时
+     *        搜索只在含 ♦3 的走法中择优，避免选出会被引擎兜底改写的非法首手
+     * @param mustTopBig 下家是否已报单（顶大义务）：为 true 时单张走法只保留手中最大的那张，
+     *        与引擎侧的顶大校验保持一致
+     * @param cancelled 取消判定（如新开一局后旧搜索应立即退出）；返回 true 时尽快结束
      * @return 最优出牌（[CardGroup]）；跟牌且搜索认为过牌最优时返回 null。
      */
     fun solve(
@@ -79,7 +96,10 @@ internal object MasterSearch {
         passes: Int,
         current: Int,
         deadlineMs: Long,
-        nodeLimit: Int
+        nodeLimit: Int,
+        mustContainDiamond3: Boolean = false,
+        mustTopBig: Boolean = false,
+        cancelled: () -> Boolean = { false }
     ): CardGroup? {
         val myHand = hands[myIndex] ?: return null
         if (myHand.isEmpty()) return null
@@ -92,8 +112,10 @@ internal object MasterSearch {
             passes = passes
         )
 
-        val rootMoves = generateMoves(state, myIndex)
-        if (rootMoves.isEmpty()) return null   // 不应发生：自由出牌必有走法
+        val rawMoves = generateMoves(state, myIndex)
+        if (rawMoves.isEmpty()) return null   // 不应发生：自由出牌必有走法
+        // 流程性约束先落到根走法集上，使搜索结果本身就是合法的一手
+        val rootMoves = applyRootConstraints(rawMoves, myHand, mustContainDiamond3, mustTopBig)
 
         val deadline = System.currentTimeMillis() + deadlineMs
         val counter = longArrayOf(0L)
@@ -101,18 +123,19 @@ internal object MasterSearch {
         var bestMove: Move? = rootMoves.first()
 
         for (depth in 1..MAX_DEPTH) {
+            if (cancelled()) break
             val rootOrdered = orderMoves(state, myIndex, rootMoves, isMax = true)
             var bestVal = -INF
             var localBest: Move? = null
             var alpha = -INF
 
             for (mv in rootOrdered) {
-                if (System.currentTimeMillis() > deadline || counter[0] > nodeLimit) break
+                if (System.currentTimeMillis() > deadline || counter[0] > nodeLimit || cancelled()) break
                 val undo = applyMove(state, myIndex, mv)
                 val v = when {
-                    undo.winner == myIndex -> WIN - 0
-                    undo.winner >= 0 -> -(WIN - 0)
-                    else -> search(state, myIndex, alpha, INF, depth - 1, 1, deadline, counter, nodeLimit)
+                    undo.winner == myIndex -> WIN
+                    undo.winner >= 0 -> -WIN
+                    else -> search(state, myIndex, alpha, INF, depth - 1, 1, deadline, counter, nodeLimit, cancelled)
                 }
                 undoMove(state, undo)
 
@@ -121,7 +144,7 @@ internal object MasterSearch {
             }
 
             // 仅采纳完整跑完当前深度的结果
-            if (System.currentTimeMillis() <= deadline && counter[0] <= nodeLimit) {
+            if (System.currentTimeMillis() <= deadline && counter[0] <= nodeLimit && !cancelled()) {
                 if (localBest != null) bestMove = localBest
                 // 已找到必胜首手，提前结束
                 if (bestVal >= WIN - 1) break
@@ -138,6 +161,45 @@ internal object MasterSearch {
     }
 
     /**
+     * 把「首手含方块 3」「顶大」这两条流程规则施加到根走法集合上。
+     * 两者同时成立时取交集；交集为空则优先满足更硬的规则（首手 ♦3）。
+     */
+    private fun applyRootConstraints(
+        moves: List<Move>,
+        hand: List<Card>,
+        mustContainDiamond3: Boolean,
+        mustTopBig: Boolean
+    ): List<Move> {
+        var result = moves
+
+        if (mustContainDiamond3) {
+            val d3 = hand.firstOrNull { it.rank == 3 && it.suit == Suit.DIAMOND }
+            if (d3 != null) {
+                val withD3 = result.filter { mv ->
+                    mv is Move.Play && mv.group.cards.any { it.id == d3.id }
+                }
+                result = withD3.ifEmpty {
+                    listOf(Move.Play(CardGroup(CardType.SINGLE, 3, 1, listOf(d3), d3.suit.order)))
+                }
+            }
+        }
+
+        if (mustTopBig) {
+            val max = hand.maxWithOrNull(compareBy({ it.rank }, { it.suit.order }))
+            if (max != null) {
+                val topOnly = result.filter { mv ->
+                    mv !is Move.Play || mv.group.type != CardType.SINGLE ||
+                        mv.group.cards.singleOrNull()?.id == max.id
+                }
+                // 过滤后为空说明只剩非最大单张可选，此时保留原集合（引擎侧仍会兜底改判）
+                if (topOnly.isNotEmpty()) result = topOnly
+            }
+        }
+
+        return result.ifEmpty { moves }
+    }
+
+    /**
      * 博弈树搜索（值始终从 myIndex 视角返回）。
      * cur == myIndex 为 MAX 节点，否则为 MIN 节点（全场联盟）。
      */
@@ -150,10 +212,11 @@ internal object MasterSearch {
         ply: Int,
         deadline: Long,
         counter: LongArray,
-        nodeLimit: Int
+        nodeLimit: Int,
+        cancelled: () -> Boolean
     ): Int {
         counter[0]++
-        if (System.currentTimeMillis() > deadline || counter[0] > nodeLimit) {
+        if (System.currentTimeMillis() > deadline || counter[0] > nodeLimit || cancelled()) {
             return evaluate(state, myIndex)
         }
         if (depth <= 0) return evaluate(state, myIndex)
@@ -174,7 +237,7 @@ internal object MasterSearch {
             val v = when {
                 undo.winner == myIndex -> WIN - ply
                 undo.winner >= 0 -> -(WIN - ply)
-                else -> search(state, myIndex, alpha, beta, depth - 1, ply + 1, deadline, counter, nodeLimit)
+                else -> search(state, myIndex, alpha, beta, depth - 1, ply + 1, deadline, counter, nodeLimit, cancelled)
             }
             undoMove(state, undo)
 
@@ -261,7 +324,7 @@ internal object MasterSearch {
                     val base = if (empties) 1 else 0
                     base * 1_000_000 + mv.group.mainRank * (if (isMax) 1 else -1)
                 }
-                is Move.Pass -> if (isMax) Int.MAX_VALUE else Int.MAX_VALUE   // 过牌最后
+                is Move.Pass -> Int.MAX_VALUE       // 过牌在两类节点中都排最后
             }
             mv to priority
         }
@@ -302,11 +365,23 @@ internal object MasterSearch {
 
             // 1) 最长同花顺（取该花色最长连续段，每点数取一张）
             for (s in 0..3) {
-                val ranks = remaining.filter { it.suit.order == s }.map { it.rank }.distinct().sorted()
-                val run = longestRun(ranks, 3, 14)
+                val rankSet = remaining.filter { it.suit.order == s }.map { it.rank }.toSortedSet()
+                val run = longestRun(rankSet.toList(), 3, 14)
                 if (run.size >= 5) {
-                    val toRemove = run.mapNotNull { r -> remaining.firstOrNull { c -> c.suit.order == s && c.rank == r } }
-                    if (toRemove.size == run.size) {
+                    // 顺子/同花顺固定 5 张：长连续段需拆成多次出牌
+                    val five = run.take(5)
+                    val toRemove = five.mapNotNull { r -> remaining.firstOrNull { c -> c.suit.order == s && c.rank == r } }
+                    if (toRemove.size == five.size) {
+                        remaining.removeAll(toRemove)
+                        plays++; did = true; break
+                    }
+                }
+                // A-2-3-4-5 同花顺（A 作 1，为最小顺子）
+                if (A2345.all { it in rankSet }) {
+                    val toRemove = A2345.mapNotNull { r ->
+                        remaining.firstOrNull { c -> c.suit.order == s && c.rank == r }
+                    }
+                    if (toRemove.size == A2345.size) {
                         remaining.removeAll(toRemove)
                         plays++; did = true; break
                     }
@@ -319,9 +394,14 @@ internal object MasterSearch {
             for (c in remaining) cnt[c.rank]++
             val allRanks = (3..14).filter { cnt[it] > 0 }
             val run2 = longestRun(allRanks, 3, 14)
-            if (run2.size >= 5) {
-                val toRemove = run2.mapNotNull { r -> remaining.firstOrNull { c -> c.rank == r } }
-                if (toRemove.size == run2.size) {
+            val straight: List<Int>? = when {
+                run2.size >= 5 -> run2.take(5)
+                A2345.all { cnt[it] > 0 } -> A2345      // A-2-3-4-5（A 作 1）
+                else -> null
+            }
+            if (straight != null) {
+                val toRemove = straight.mapNotNull { r -> remaining.firstOrNull { c -> c.rank == r } }
+                if (toRemove.size == straight.size) {
                     remaining.removeAll(toRemove)
                     plays++; continue
                 }

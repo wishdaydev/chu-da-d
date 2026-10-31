@@ -13,28 +13,29 @@ import com.chudad.game.model.Suit
  *   - 点数序：3 < 4 < … < 10 < J < Q < K < A < 2（2 最大）
  *   - 花色序（同点数比较）：♦方块(0) < ♣梅花(1) < ♥红桃(2) < ♠黑桃(3)
  *
- * 二、牌型与层级（低 → 高）
- *   单张(1) < 对子(2) < 三条(3) < 顺子(5+) < 葫芦(3+2) < 四带一(4+1) < 同花顺(5+)
- *   - 顺子：5 张及以上连续单牌，不可含 2（即点数上限 A=14）
- *   - 葫芦：三条 + 对子（5 张），比较时看三条点数
- *   - 四带一：四条 + 1 张散牌（5 张），比较时看四条点数
- *   - 同花顺：5 张及以上连续且同花色，为最大牌型
+ * 二、牌型
+ *   单张(1) / 对子(2) / 三条(3)
+ *   五张牌型（层级低 → 高）：顺子 < 同花五 < 葫芦 < 四带一 < 同花顺
+ *   - 顺子：5 张连续，A 可作 1（A-2-3-4-5，最小）或作最大（10-J-Q-K-A）
+ *   - 同花五：5 张同花色但点数不连续
+ *   - 葫芦：三条 + 对子
+ *   - 四带一：四条 + 1 张散牌
+ *   - 同花顺：5 张连续且同花色
  *
  * 三、跟牌规则
- *   - 必须同牌型、同长度且更大（顺子/同花顺长度须一致，比较最大牌）
- *   - 强牌例外：四带一可压任意「非同花顺」牌型；同花顺可压任意「非同花顺」牌型
- *   - 同花顺之间：须同长度且更大
+ *   - 张数必须相同；单张/对子/三条须同牌型且更大
+ *   - 五张牌型按上表层级跨型比较；同型只比主体最大牌点，不再比花色
  */
 object CardRuleEngine {
 
-    /** 顺子/同花顺最短长度 */
-    const val MIN_STRAIGHT = 5
+    /** 顺子 / 同花顺固定张数 */
+    const val STRAIGHT_LEN = 5
 
-    /** 顺子可使用的最大点数（A=14；2=15 不参与顺子） */
-    const val STRAIGHT_MAX_RANK = 14
+    /** A 的点数 */
+    private const val RANK_A = 14
 
-    /** 顺子/同花顺最长长度（3..A 共 12 个点数） */
-    private const val MAX_STRAIGHT = 12
+    /** 2 的点数（顺子中仅可与 A-3-4-5 组成最小顺子） */
+    private const val RANK_TWO = 15
 
     // ============================== 识别 ==============================
 
@@ -53,59 +54,71 @@ object CardRuleEngine {
 
         return when {
             // 单张
-            n == 1 -> group(CardType.SINGLE, sorted[0].rank, 1, sorted)
+            n == 1 -> group(CardType.SINGLE, sorted[0].rank, sorted)
 
             // 对子：2 张同点
-            n == 2 && counts == listOf(2) -> group(CardType.PAIR, sorted[0].rank, 1, sorted)
+            n == 2 && counts == listOf(2) -> group(CardType.PAIR, sorted[0].rank, sorted)
 
             // 三条：3 张同点
-            n == 3 && counts == listOf(3) -> group(CardType.TRIPLE, sorted[0].rank, 1, sorted)
+            n == 3 && counts == listOf(3) -> group(CardType.TRIPLE, sorted[0].rank, sorted)
 
-            // 顺子 / 同花顺：5+ 张、点数互不相同、连续、且不含 2
-            n >= MIN_STRAIGHT &&
-                    rankCounts.size == n &&
-                    isConsecutive(sorted.map { it.rank }) &&
-                    sorted.all { it.rank <= STRAIGHT_MAX_RANK } -> {
+            // 五张且点数互不相同：顺子 / 同花顺 / 同花五
+            n == STRAIGHT_LEN && rankCounts.size == n -> {
                 val flush = sorted.all { it.suit == sorted[0].suit }
-                group(
-                    if (flush) CardType.STRAIGHT_FLUSH else CardType.STRAIGHT,
-                    sorted.last().rank,
-                    n,
-                    sorted
-                )
+                val high = straightHighRank(sorted.map { it.rank })
+                when {
+                    high != null -> group(
+                        if (flush) CardType.STRAIGHT_FLUSH else CardType.STRAIGHT,
+                        high, sorted
+                    )
+                    flush -> group(CardType.FLUSH, sorted.last().rank, sorted)
+                    else -> CardGroup.INVALID
+                }
             }
 
-            // 葫芦（三带二）：5 张 = 3 + 2
-            n == 5 && counts == listOf(2, 3) -> {
+            // 葫芦（三带二）：3 + 2
+            n == STRAIGHT_LEN && counts == listOf(2, 3) -> {
                 val tripleRank = rankCounts.entries.first { it.value == 3 }.key
-                group(CardType.FULL_HOUSE, tripleRank, 1, sorted)
+                group(CardType.FULL_HOUSE, tripleRank, sorted)
             }
 
-            // 四带一：5 张 = 4 + 1
-            n == 5 && counts == listOf(1, 4) -> {
+            // 四带一：4 + 1
+            n == STRAIGHT_LEN && counts == listOf(1, 4) -> {
                 val fourRank = rankCounts.entries.first { it.value == 4 }.key
-                group(CardType.FOUR_WITH_ONE, fourRank, 1, sorted)
+                group(CardType.FOUR_WITH_ONE, fourRank, sorted)
             }
 
             else -> CardGroup.INVALID
         }
     }
 
-    /** 判断排序后的点数序列是否严格连续 */
-    private fun isConsecutive(ranks: List<Int>): Boolean {
-        for (i in 1 until ranks.size) {
-            if (ranks[i] != ranks[i - 1] + 1) return false
+    /**
+     * 5 张点数是否构成顺子。
+     * @return 顺子的「主体最大牌点」（A-2-3-4-5 返回 5，10-J-Q-K-A 返回 14）；非顺子返回 null
+     */
+    fun straightHighRank(ranks: List<Int>): Int? {
+        if (ranks.size != STRAIGHT_LEN || ranks.toSet().size != STRAIGHT_LEN) return null
+        val sorted = ranks.sorted()
+        // 普通顺子：3..A 内严格连续
+        if (sorted.all { it in 3..RANK_A } &&
+            sorted.zipWithNext().all { (a, b) -> b == a + 1 }
+        ) {
+            return sorted.last()
         }
-        return true
+        // A-2-3-4-5：A 作 1，主体最大牌点为 5（最小顺子）
+        if (sorted == listOf(3, 4, 5, RANK_A, RANK_TWO)) return 5
+        return null
     }
 
-    /** 构造 CardGroup，自动计算决定性的花色序 */
-    private fun group(type: CardType, mainRank: Int, length: Int, cards: List<Card>): CardGroup =
-        CardGroup(type, mainRank, length, cards, topSuitOf(cards))
+    /** 构造 CardGroup：五张牌型 length=5，其余 length=1 */
+    private fun group(type: CardType, mainRank: Int, cards: List<Card>): CardGroup {
+        val len = if (cards.size == STRAIGHT_LEN) STRAIGHT_LEN else 1
+        return CardGroup(type, mainRank, len, cards, topSuitOf(cards))
+    }
 
     /**
-     * 决定性花色序：取「最大点数」的那些牌中花色最大的一张
-     * 单张→自身花色；对子/三条/四条→其中最大花色；顺子→最大牌的花色
+     * 决定性花色序：取「最大点数」的那些牌中花色最大的一张。
+     * 仅用于单张 / 对子 / 三条的同点比较；五张牌型只比主体点数，不参与花色比较。
      */
     private fun topSuitOf(cards: List<Card>): Int {
         if (cards.isEmpty()) return 0
@@ -117,26 +130,32 @@ object CardRuleEngine {
 
     /**
      * 比较两组牌的大小
-     * @return 正数表示 group1 大，负数表示 group2 大，0 表示不可比/相等
+     * @return 正数表示 group1 大，负数表示 group2 大，0 表示不可比 / 相等
      */
     fun compare(group1: CardGroup, group2: CardGroup): Int {
         if (group1.type == CardType.INVALID || group2.type == CardType.INVALID) return 0
 
-        // 不同牌型：按层级比较
-        if (group1.type != group2.type) return group1.type.level.compareTo(group2.type.level)
+        // 不同牌型：仅五张牌型之间按层级跨型比较，其余不可比
+        if (group1.type != group2.type) {
+            if (group1.cards.size == STRAIGHT_LEN && group2.cards.size == STRAIGHT_LEN) {
+                return group1.type.level.compareTo(group2.type.level)
+            }
+            return 0
+        }
 
-        // 同牌型：长度必须一致（顺子/同花顺）
-        if (group1.length != group2.length) return 0
-
-        // 先比主牌点数，再比决定性花色
+        // 同牌型：先比主体点数
         val r = group1.mainRank.compareTo(group2.mainRank)
-        return if (r != 0) r else group1.topSuitOrder.compareTo(group2.topSuitOrder)
+        if (r != 0) return r
+
+        // 五张牌型同点即相等（不比花色）；单张 / 对子 / 三条再比花色
+        if (group1.cards.size == STRAIGHT_LEN) return 0
+        return group1.topSuitOrder.compareTo(group2.topSuitOrder)
     }
 
     // ============================== 合法性 ==============================
 
     /**
-     * 校验出牌是否合法
+     * 校验出牌是否合法（不含「首手带方块3」「顶大」等流程性约束，那些由 GameEngine 校验）
      * @param played 当前要出的牌
      * @param lastPlay 上一手牌（null 或 INVALID 表示自由出牌）
      */
@@ -146,28 +165,15 @@ object CardRuleEngine {
         // 自由出牌：首家可出任意合法牌型
         if (lastPlay == null || lastPlay.type == CardType.INVALID) return true
 
-        // 同花顺：终极牌型，可压任意非同花顺；同花顺之间须同长度且更大
-        if (played.type == CardType.STRAIGHT_FLUSH) {
-            return if (lastPlay.type == CardType.STRAIGHT_FLUSH) {
-                played.length == lastPlay.length && compare(played, lastPlay) > 0
-            } else true
-        }
-        // 上家是同花顺：只能被更高同花顺压
-        if (lastPlay.type == CardType.STRAIGHT_FLUSH) return false
+        // 张数必须相同
+        if (played.cards.size != lastPlay.cards.size) return false
 
-        // 四带一：可压任意非同花顺牌型；四带一之间比四条点数
-        if (played.type == CardType.FOUR_WITH_ONE) {
-            return if (lastPlay.type == CardType.FOUR_WITH_ONE) {
-                compare(played, lastPlay) > 0
-            } else true
-        }
+        // 五张牌型：按层级跨型，同型比主体点数
+        if (played.cards.size == STRAIGHT_LEN) return compare(played, lastPlay) > 0
 
-        // 其余：必须同牌型、同长度且更大
-        if (played.type == lastPlay.type && played.length == lastPlay.length) {
-            return compare(played, lastPlay) > 0
-        }
-
-        return false
+        // 单张 / 对子 / 三条：必须同牌型且更大
+        if (played.type != lastPlay.type) return false
+        return compare(played, lastPlay) > 0
     }
 
     // ============================== 候选生成 ==============================
@@ -187,69 +193,15 @@ object CardRuleEngine {
             return findAllPossiblePlays(sorted)
         }
 
-        val results = mutableListOf<CardGroup>()
-        val byRank = byRank(sorted)
-
-        when (lastPlay.type) {
-            CardType.SINGLE -> {
-                for (c in sorted) {
-                    if (c.rank > lastPlay.mainRank ||
-                        (c.rank == lastPlay.mainRank && c.suit.order > lastPlay.topSuitOrder)
-                    ) {
-                        results.add(group(CardType.SINGLE, c.rank, 1, listOf(c)))
-                    }
-                }
-            }
-
-            CardType.PAIR -> {
-                for ((rank, cards) in byRank) {
-                    if (cards.size < 2) continue
-                    val g = group(CardType.PAIR, rank, 1, cards.takeLast(2))
-                    if (compare(g, lastPlay) > 0) results.add(g)
-                }
-            }
-
-            CardType.TRIPLE -> {
-                for ((rank, cards) in byRank) {
-                    if (cards.size < 3) continue
-                    val g = group(CardType.TRIPLE, rank, 1, cards.takeLast(3))
-                    if (compare(g, lastPlay) > 0) results.add(g)
-                }
-            }
-
-            CardType.STRAIGHT -> {
-                genStraights(sorted, lastPlay.length, false)
-                    .filterTo(results) { compare(it, lastPlay) > 0 }
-            }
-
-            CardType.FULL_HOUSE -> {
-                genFullHouses(sorted).filterTo(results) { compare(it, lastPlay) > 0 }
-            }
-
-            CardType.FOUR_WITH_ONE -> {
-                // 四带一之间比四条点数（已在上面分支内筛选更大的）
-                genFourWithOne(sorted).filterTo(results) { compare(it, lastPlay) > 0 }
-            }
-
-            CardType.STRAIGHT_FLUSH -> {
-                genStraights(sorted, lastPlay.length, true)
-                    .filterTo(results) { compare(it, lastPlay) > 0 }
-            }
-
-            else -> {}
+        // 跟牌：只生成与上家相同张数的候选，再按规则筛选
+        val candidates = when (lastPlay.cards.size) {
+            1 -> genSingles(sorted)
+            2 -> genPairs(sorted)
+            3 -> genTriples(sorted)
+            STRAIGHT_LEN -> genFiveCardPlays(sorted)
+            else -> emptyList()
         }
-
-        // 强牌补充：上家不是同花顺时，四带一/同花顺 均可压
-        if (lastPlay.type != CardType.STRAIGHT_FLUSH) {
-            // 四带一：若上家不是四带一，任意四带一都可压（本游戏最强牌型之一）
-            if (lastPlay.type != CardType.FOUR_WITH_ONE) {
-                results.addAll(genFourWithOne(sorted))
-            }
-            // 同花顺：任意同花顺都可压非同花顺
-            results.addAll(genStraights(sorted, null, true))
-        }
-
-        return results.distinct()
+        return candidates.filterTo(mutableListOf()) { isValidPlay(it, lastPlay) }.distinct()
     }
 
     /** 自由出牌时的全部候选 */
@@ -258,26 +210,34 @@ object CardRuleEngine {
         results.addAll(genSingles(sorted))
         results.addAll(genPairs(sorted))
         results.addAll(genTriples(sorted))
-        results.addAll(genStraights(sorted, null, false))
-        results.addAll(genStraights(sorted, null, true))
-        results.addAll(genFullHouses(sorted))
-        results.addAll(genFourWithOne(sorted))
+        results.addAll(genFiveCardPlays(sorted))
         return results.distinct()
     }
 
-    /** 按点数分组，组内按花色序升序（便于 takeLast 取大花色） */
+    /** 五张牌型的全部候选：顺子 / 同花顺 / 同花五 / 葫芦 / 四带一 */
+    private fun genFiveCardPlays(sorted: List<Card>): List<CardGroup> {
+        val results = mutableListOf<CardGroup>()
+        results.addAll(genStraights(sorted, flush = false))
+        results.addAll(genStraights(sorted, flush = true))
+        results.addAll(genFlushes(sorted))
+        results.addAll(genFullHouses(sorted))
+        results.addAll(genFourWithOne(sorted))
+        return results
+    }
+
+    /** 按点数分组，组内按花色序升序（便于 last 取大花色） */
     private fun byRank(sorted: List<Card>): Map<Int, List<Card>> =
         sorted.groupBy { it.rank }
             .mapValues { it.value.sortedBy { c -> c.suit.order } }
             .toSortedMap()
 
     private fun genSingles(sorted: List<Card>): List<CardGroup> =
-        sorted.map { group(CardType.SINGLE, it.rank, 1, listOf(it)) }
+        sorted.map { group(CardType.SINGLE, it.rank, listOf(it)) }
 
     private fun genPairs(sorted: List<Card>): List<CardGroup> {
         val results = mutableListOf<CardGroup>()
         for ((rank, cards) in byRank(sorted)) {
-            if (cards.size >= 2) results.add(group(CardType.PAIR, rank, 1, cards.takeLast(2)))
+            if (cards.size >= 2) results.add(group(CardType.PAIR, rank, cards.takeLast(2)))
         }
         return results
     }
@@ -285,7 +245,7 @@ object CardRuleEngine {
     private fun genTriples(sorted: List<Card>): List<CardGroup> {
         val results = mutableListOf<CardGroup>()
         for ((rank, cards) in byRank(sorted)) {
-            if (cards.size >= 3) results.add(group(CardType.TRIPLE, rank, 1, cards.takeLast(3)))
+            if (cards.size >= 3) results.add(group(CardType.TRIPLE, rank, cards.takeLast(3)))
         }
         return results
     }
@@ -300,7 +260,7 @@ object CardRuleEngine {
             for (p in pairRanks) {
                 if (p == t) continue
                 val pair = byRank[p]!!.takeLast(2)
-                results.add(group(CardType.FULL_HOUSE, t, 1, triple + pair))
+                results.add(group(CardType.FULL_HOUSE, t, triple + pair))
             }
         }
         return results
@@ -313,7 +273,7 @@ object CardRuleEngine {
             if (cards.size < 4) continue
             val four = cards.takeLast(4)
             val kicker = pickKicker(sorted, rank) ?: continue
-            results.add(group(CardType.FOUR_WITH_ONE, rank, 1, four + kicker))
+            results.add(group(CardType.FOUR_WITH_ONE, rank, four + kicker))
         }
         return results
     }
@@ -332,50 +292,79 @@ object CardRuleEngine {
     }
 
     /**
-     * 生成顺子 / 同花顺
-     * @param requireLen 指定长度（跟牌时与上家一致）；null 表示生成 5..最大 的所有长度
+     * 生成顺子 / 同花顺（均固定 5 张，含 A-2-3-4-5）
      * @param flush true 生成同花顺（按花色分别找连续段）
      */
-    private fun genStraights(
-        sorted: List<Card>,
-        requireLen: Int?,
-        flush: Boolean
-    ): List<CardGroup> {
+    private fun genStraights(sorted: List<Card>, flush: Boolean): List<CardGroup> {
         val results = mutableListOf<CardGroup>()
+        val type = if (flush) CardType.STRAIGHT_FLUSH else CardType.STRAIGHT
 
         val pools: List<Map<Int, List<Card>>> = if (flush) {
-            Suit.values().map { s ->
-                sorted.filter { it.suit == s }.groupBy { it.rank }
-            }
+            Suit.values().map { s -> sorted.filter { it.suit == s }.groupBy { it.rank } }
         } else {
-            listOf(byRank(sorted))
+            listOf(sorted.groupBy { it.rank })
         }
 
         for (pool in pools) {
-            val ranks = pool.keys.filter { it in 3..STRAIGHT_MAX_RANK }.sorted()
-            if (ranks.isEmpty()) continue
-
+            val ranks = pool.keys.filter { it in 3..RANK_A }.sorted()
             var i = 0
             while (i < ranks.size) {
                 var j = i
                 while (j + 1 < ranks.size && ranks[j + 1] == ranks[j] + 1) j++
-                val runLen = j - i + 1
-
-                val from = requireLen ?: MIN_STRAIGHT
-                val to = requireLen ?: MAX_STRAIGHT
-
-                for (len in from..to) {
-                    if (len > runLen) break
-                    if (len < MIN_STRAIGHT) continue
-                    for (start in i..(j - len + 1)) {
-                        val seqRanks = (start until start + len).map { ranks[it] }
-                        // 每个点数取花色最大的一张（最强代表）
-                        val cards = seqRanks.map { r -> pool[r]!!.last() }
-                        val type = if (flush) CardType.STRAIGHT_FLUSH else CardType.STRAIGHT
-                        results.add(group(type, seqRanks.last(), len, cards))
+                if (j - i + 1 >= STRAIGHT_LEN) {
+                    for (start in i..(j - STRAIGHT_LEN + 1)) {
+                        val seq = (start until start + STRAIGHT_LEN).map { ranks[it] }
+                        val cards = seq.map { r -> pool[r]!!.last() }
+                        // 非同花分支选出的牌若恰好同花，实际是同花顺（由 flush 分支生成），
+                        // 不能标成顺子，否则会被低层级牌误压。
+                        if (!flush && cards.all { it.suit == cards[0].suit }) continue
+                        results.add(group(type, seq.last(), cards))
                     }
                 }
                 i = j + 1
+            }
+
+            // A-2-3-4-5（A 作 1）：主体最大牌点为 5
+            if (pool.containsKey(3) && pool.containsKey(4) && pool.containsKey(5) &&
+                pool.containsKey(RANK_A) && pool.containsKey(RANK_TWO)
+            ) {
+                val seq = listOf(3, 4, 5, RANK_A, RANK_TWO)
+                val cards = seq.map { r -> pool[r]!!.last() }
+                if (flush || cards.any { it.suit != cards[0].suit }) {
+                    results.add(group(type, 5, cards))
+                }
+            }
+        }
+        return results
+    }
+
+    /**
+     * 生成同花五（5 张同花色、点数不连续）。
+     * 每个花色按点数升序取 5 张滑窗，跳过恰好成顺子的窗口（那是同花顺）；
+     * 若整副花色都是连续段，则用第 6 张替换中间张构造一个非顺子组合。
+     */
+    private fun genFlushes(sorted: List<Card>): List<CardGroup> {
+        val results = mutableListOf<CardGroup>()
+        for (s in Suit.values()) {
+            val cards = sorted.filter { it.suit == s }.sortedBy { it.rank }
+            if (cards.size < STRAIGHT_LEN) continue
+
+            for (hi in STRAIGHT_LEN - 1 until cards.size) {
+                val win = cards.subList(hi - STRAIGHT_LEN + 1, hi + 1).toList()
+                if (straightHighRank(win.map { it.rank }) != null) continue
+                results.add(group(CardType.FLUSH, win.last().rank, win))
+            }
+
+            // 兜底：窗口全是顺子时，替换中间一张构造非顺子同花
+            if (cards.size > STRAIGHT_LEN) {
+                val base = cards.take(STRAIGHT_LEN).toMutableList()
+                if (straightHighRank(base.map { it.rank }) != null) {
+                    base[STRAIGHT_LEN / 2] = cards[STRAIGHT_LEN]
+                    val fixed = base.sortedBy { it.rank }
+                    if (straightHighRank(fixed.map { it.rank }) == null) {
+                        results.add(group(CardType.FLUSH, fixed.last().rank, fixed))
+                    }
+                }
             }
         }
         return results

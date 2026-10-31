@@ -18,6 +18,7 @@ import com.chudad.game.logic.GameEngine
 import com.chudad.game.model.Card
 import com.chudad.game.model.CardType
 import com.chudad.game.model.Difficulty
+import com.chudad.game.model.Suit
 import com.chudad.game.state.GamePhase
 import kotlin.math.PI
 import kotlin.math.cos
@@ -525,12 +526,21 @@ class GameSurfaceView(context: Context) : SurfaceView(context), SurfaceHolder.Ca
     private var lastRoundScoreDelta = 0
     @Volatile
     private var lastRoundMultiplierText = ""
+    /** 本局得分变化为 0 时是否仍展示积分行（顶大代付等场景 0 分本身有含义） */
+    @Volatile
+    private var lastRoundForceShowScore = false
 
     /** 记录结算结果并触发横幅滑入动画；scoreDelta/springTag 为结算积分提示文案（并入横幅显示） */
-    fun showSettlement(humanWin: Boolean, scoreDelta: Int = 0, multiplierText: String = "") {
+    fun showSettlement(
+        humanWin: Boolean,
+        scoreDelta: Int = 0,
+        multiplierText: String = "",
+        forceShowScore: Boolean = false
+    ) {
         lastRoundHumanWin = humanWin
         lastRoundScoreDelta = scoreDelta
         lastRoundMultiplierText = multiplierText
+        lastRoundForceShowScore = forceShowScore
         gameOverAnimStart = System.currentTimeMillis()
         // 结算时保留最后一手打出的牌：桌面出牌展示与「不出」气泡原样留在桌上不清空，
         // 重开一局/返回主界面时才由 clearAllPlayedCards 清除
@@ -1215,6 +1225,24 @@ class GameSurfaceView(context: Context) : SurfaceView(context), SurfaceHolder.Ca
                     if (lastGroup != null && lastPlayer != 0) {
                         if (!com.chudad.game.logic.CardRuleEngine.isValidPlay(group, lastGroup)) {
                             rejectPlay("打不过上家的牌，请重新选择", 2000)
+                            return
+                        }
+                    }
+                    // 第一局首手必须带方块 3
+                    if (gameEngine.isDiamond3LeadRequired() &&
+                        selectedCards.none { it.rank == 3 && it.suit == Suit.DIAMOND }
+                    ) {
+                        rejectPlay("首手必须带方块3", 2000)
+                        return
+                    }
+                    // 顶大：下家报单时，若出单张必须是手中最大
+                    if (gameEngine.mustTopBig(0) && group.type == CardType.SINGLE) {
+                        val maxCard = gameEngine.players[0].handCards
+                            .maxWithOrNull(compareBy({ it.rank }, { it.suit.order }))
+                        if (maxCard != null && selectedCards.size == 1 &&
+                            selectedCards[0].id != maxCard.id
+                        ) {
+                            rejectPlay("下家报单，单张必须出最大", 2000)
                             return
                         }
                     }
@@ -2384,9 +2412,13 @@ class GameSurfaceView(context: Context) : SurfaceView(context), SurfaceHolder.Ca
             else -> "再接再厉"
         }
         // 第三行：本局得分变化 + 倍数说明（合并自原 showMessage 的结算积分提示）
-        // scoreDelta=0 视为未提供积分信息：隐藏该行并压缩布局，避免显示误导性的「本局 +0 分」
-        val hasScore = lastRoundScoreDelta != 0
-        val sign = if (lastRoundScoreDelta >= 0) "+" else "-"
+        // scoreDelta=0 默认隐藏该行（避免误导性的「+0 分」）；顶大代付等语义化 0 分由 forceShowScore 强制展示
+        val hasScore = lastRoundScoreDelta != 0 || lastRoundForceShowScore
+        val sign = when {
+            lastRoundScoreDelta > 0 -> "+"
+            lastRoundScoreDelta < 0 -> "-"
+            else -> "±"
+        }
         val scoreLine = "本局 $sign${abs(lastRoundScoreDelta)} 分" +
             if (lastRoundMultiplierText.isNotEmpty()) "（${lastRoundMultiplierText}）" else ""
 
@@ -2754,11 +2786,11 @@ class GameSurfaceView(context: Context) : SurfaceView(context), SurfaceHolder.Ca
         buttonTextPaint.color = Color.WHITE
         canvas.drawText("${masterThinkSeconds} 秒", px + pw / 2f, sby + 80f * ms / 2f + 18f * ms, buttonTextPaint)
 
-        // 底部说明（仅保留该段文字，分两行以免超出面板宽度）
-        // 下移并放大字号：避免第一行字顶侵入上方步进按钮（步进按钮底在 py+600）
+        // 底部说明：两行，明确「思考时间只在电脑ai=大师时生效」，避免误以为设置无效
         buttonTextPaint.textSize = 28f * ms
         buttonTextPaint.color = Color.parseColor("#9E9E9E")
-        canvas.drawText("（电脑ai设为普通，对手更易战胜）", px + pw / 2f, py + ph - 40f * ms, buttonTextPaint)
+        canvas.drawText("（电脑ai设为普通，对手更易战胜）", px + pw / 2f, py + ph - 72f * ms, buttonTextPaint)
+        canvas.drawText("（最大思考时间仅大师ai生效，越长越强）", px + pw / 2f, py + ph - 36f * ms, buttonTextPaint)
     }
 
     /** 策略二选一开关：选中项高亮（绿），未选中灰 */

@@ -21,7 +21,9 @@ KOTLIN_STDLIB=$(ls -1 "$GRADLE_LIB"/kotlin-stdlib-*.jar 2>/dev/null | head -1)
 
 if ! command -v "$KOTLINC" >/dev/null 2>&1; then
     if [ -n "$GRADLE_LIB" ] && [ -f "$GRADLE_LIB"/kotlin-compiler-embeddable-*.jar ]; then
-        KOTLINC() {
+        # 函数名必须与 $KOTLINC 展开后的命令名一致（kotlinc），
+        # 否则 $KOTLINC 会当作外部命令查找而报 "command not found"，导致预检假通过。
+        kotlinc() {
             java -cp "$GRADLE_LIB/*" \
                 org.jetbrains.kotlin.cli.jvm.K2JVMCompiler \
                 -cp "$KOTLIN_STDLIB" "$@"
@@ -34,9 +36,12 @@ if ! command -v "$KOTLINC" >/dev/null 2>&1; then
 fi
 
 # 收集所有纯逻辑的 kt 文件（排除 Android UI 文件，避免引入 SDK 依赖）
+# SoundEngine 直接依赖 android.media.*，与 MainActivity/GameSurfaceView 同属 Android 组件，
+# 一并排除；否则其大量 unresolved 连锁报错会淹没逻辑层的真实错误。
 FILES=$(find "$SRC_DIR" -name "*.kt" \
     | grep -v "MainActivity.kt" \
-    | grep -v "GameSurfaceView.kt")
+    | grep -v "GameSurfaceView.kt" \
+    | grep -v "SoundEngine.kt")
 
 echo "=== Kotlin 编译预检 ==="
 echo "$FILES" | sed 's/^/  /'
@@ -52,6 +57,10 @@ REAL_ERRORS=$(echo "$ERRORS" | grep -E "^.*\.kt:[0-9]+:" \
     | grep -v "unresolved reference: androidx" \
     | grep -v "unresolved reference: Handler" \
     | grep -v "unresolved reference: Looper" \
+    | grep -v "unresolved reference 'android'" \
+    | grep -v "unresolved reference 'androidx'" \
+    | grep -v "unresolved reference 'Handler'" \
+    | grep -v "unresolved reference 'Looper'" \
     | grep -v "unresolved reference: Bundle" \
     | grep -v "unresolved reference: Window" \
     | grep -v "unresolved reference: WindowManager" \

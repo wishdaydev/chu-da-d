@@ -46,6 +46,16 @@ class GameStateMachine {
     /** 胜负已定时的获胜玩家索引（-1 表示未定） */
     var winnerIndex: Int = -1
 
+    /** 本局首手是否必须包含方块 3（仅整场第一局为 true，后续局不再要求） */
+    var requireDiamond3Lead: Boolean = false
+
+    /**
+     * 顶大失职玩家索引（-1 表示无）：
+     * 下家报单时，该玩家本可用单张拦截却选择过牌；若报单者最终获胜，则据此结算惩罚。
+     * 该玩家一旦实际出牌（无论单张还是其它牌型）即清除——只有「不出」才算未顶大。
+     */
+    var topBigFailIndex: Int = -1
+
     // ============================ 阶段转换 ============================
 
     /** 转换到发牌阶段：清空本局全部状态 */
@@ -57,6 +67,8 @@ class GameStateMachine {
         passCount = 0
         playHistory.clear()
         winnerIndex = -1
+        requireDiamond3Lead = false
+        topBigFailIndex = -1
     }
 
     /** 进入主界面（难度选择）：清空本局残留状态，避免主界面残留上局牌 */
@@ -67,6 +79,8 @@ class GameStateMachine {
         passCount = 0
         playHistory.clear()
         winnerIndex = -1
+        requireDiamond3Lead = false
+        topBigFailIndex = -1
     }
 
     /**
@@ -79,6 +93,7 @@ class GameStateMachine {
         lastPlayedGroup = null
         lastPlayedPlayerIndex = -1
         passCount = 0
+        topBigFailIndex = -1
     }
 
     // ============================ 出牌 / 过牌 ============================

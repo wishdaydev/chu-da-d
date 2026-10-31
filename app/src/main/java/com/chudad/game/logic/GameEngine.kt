@@ -73,7 +73,15 @@ class GameEngine {
     private val playedByPlayer: Array<IntArray> = Array(PLAYER_COUNT) { IntArray(16) }
 
     /** 大师模式搜索「局代号」：开新局/退回菜单自增，用于丢弃后台搜索的过期结果 */
+    @Volatile
     private var searchEpoch = 0
+
+    /**
+     * 本次进程内是否已经开过第一局。
+     * 仅第一局的首手强制包含方块 3；后续局按规则应由上局冠军先出，
+     * 本项目未实现跨局记忆，仍由方块 3 持有者先出，但不再强制首手带方块 3。
+     */
+    private var hasStartedFirstGame = false
 
     /** 大师模式搜索后台线程（单线程串行，避免同时跑多个搜索） */
     private val masterSearchExecutor: java.util.concurrent.ExecutorService by lazy {
@@ -130,6 +138,9 @@ class GameEngine {
         }?.index ?: 0
 
         stateMachine.startPlaying(first)
+        // 仅整场第一局要求首手带方块 3；后续局不再要求
+        stateMachine.requireDiamond3Lead = !hasStartedFirstGame
+        hasStartedFirstGame = true
         callback?.onPlayerTurn(first)
         if (!players[first].isHuman) scheduleAIPlay(first)
         callback?.onRequestRefresh()
@@ -157,6 +168,8 @@ class GameEngine {
         val group = CardRuleEngine.identify(selectedCards)
         if (group.type == CardType.INVALID) return
         if (!CardRuleEngine.isValidPlay(group, stateMachine.lastPlayedGroup)) return
+        if (isDiamond3LeadRequired() && !containsDiamond3(selectedCards)) return
+        if (mustTopBig(0) && group.type == CardType.SINGLE && !isMaxHandSingle(0, selectedCards[0])) return
 
         processPlay(0, selectedCards, group)
     }
@@ -167,12 +180,59 @@ class GameEngine {
         if (stateMachine.currentPlayerIndex != 0) return
         if (stateMachine.mustPlay()) return   // 自由出牌 / 自己压自己时不能过
 
+        recordTopBigFailIfNeeded(0)
         processPass(0)
     }
+
+    // ============================ 流程性规则（方块3 / 顶大） ============================
+
+    /** 本局首手是否必须包含方块 3（供 UI 预校验） */
+    fun isDiamond3LeadRequired(): Boolean =
+        stateMachine.requireDiamond3Lead && stateMachine.playHistory.isEmpty()
+
+    /**
+     * 「顶大」义务：当前玩家的下家是否已报单（剩 1 张）。
+     * 有义务时若选择出单张，必须是手中最大的单张；出其它牌型不受限。
+     */
+    fun mustTopBig(playerIndex: Int): Boolean =
+        players[(playerIndex + 1) % PLAYER_COUNT].cardCount == 1
+
+    /** 该玩家是否可「顶大」：桌面上是单张，且手中有能压过它的单张 */
+    private fun canTopBigWithSingle(playerIndex: Int): Boolean {
+        val last = stateMachine.lastPlayedGroup ?: return false
+        if (last.type != CardType.SINGLE) return false
+        return players[playerIndex].handCards.any { c ->
+            CardRuleEngine.isValidPlay(
+                CardGroup(CardType.SINGLE, c.rank, 1, listOf(c), c.suit.order),
+                last
+            )
+        }
+    }
+
+    /** 出牌是否为该玩家手中最大单张（按点数、花色） */
+    private fun isMaxHandSingle(playerIndex: Int, card: Card): Boolean {
+        val max = players[playerIndex].handCards
+            .maxWithOrNull(compareBy({ it.rank }, { it.suit.order })) ?: return false
+        return max.id == card.id
+    }
+
+    /**
+     * 顶大失职标记：下家报单时选择「不出」，且手中本有能压过桌面单张的牌 → 记一次失职。
+     * 该玩家一旦实际出牌（任意牌型）即清除，符合「不强制只能出单张」的语义。
+     */
+    private fun recordTopBigFailIfNeeded(playerIndex: Int) {
+        if (!mustTopBig(playerIndex)) return
+        if (canTopBigWithSingle(playerIndex)) stateMachine.topBigFailIndex = playerIndex
+    }
+
+    private fun containsDiamond3(cards: List<Card>): Boolean =
+        cards.any { it.rank == 3 && it.suit == Suit.DIAMOND }
 
     // ============================ 出牌 / 过牌核心 ============================
 
     private fun processPlay(playerIndex: Int, cards: List<Card>, group: CardGroup) {
+        // 已实际出牌 → 顶大失职标记作废（本规则只惩罚「能顶却选择不出」）
+        if (stateMachine.topBigFailIndex == playerIndex) stateMachine.topBigFailIndex = -1
         val player = players[playerIndex]
         cards.forEach { card ->
             player.handCards.removeIf { it.id == card.id }
@@ -235,7 +295,9 @@ class GameEngine {
                     hand = players[playerIndex].handCards,
                     lastPlay = stateMachine.lastPlayedGroup,
                     opponentCardCounts = getOpponentCardCounts(playerIndex),
-                    unseenCounts = getUnseenRankCounts(playerIndex)
+                    unseenCounts = getUnseenRankCounts(playerIndex),
+                    requireDiamond3 = isDiamond3LeadRequired(),
+                    mustTopBig = mustTopBig(playerIndex)
                 )
                 applyAIDecisionPaced(playerIndex, decision, turnStartMs, epoch)
             }
@@ -250,7 +312,9 @@ class GameEngine {
             val decision = MasterAIDecision.decide(
                 snapshot,
                 deadlineMs = masterDeadlineMs,
-                nodeLimit = MASTER_NODE_LIMIT
+                nodeLimit = MASTER_NODE_LIMIT,
+                // 重开局 / 退回菜单后旧搜索立即让出线程，避免长预算下阻塞新一局
+                cancelled = { epoch != searchEpoch }
             )
             android.os.Handler(android.os.Looper.getMainLooper()).post {
                 if (epoch != searchEpoch) return@post
@@ -280,16 +344,38 @@ class GameEngine {
     }
 
     /** 统一应用 AI 决策：合法则出牌；本轮首家必须出时兜底最小单张；否则过牌 */
-    private fun applyAIDecision(playerIndex: Int, decision: CardGroup?) {
+    private fun applyAIDecision(playerIndex: Int, decisionIn: CardGroup?) {
         val player = players[playerIndex]
+        var decision = decisionIn
+
+        // 首手必须带方块 3：AI 决策未包含则兜底出方块 3 单张
+        if (isDiamond3LeadRequired()) {
+            val d3 = player.handCards.firstOrNull { it.rank == 3 && it.suit == Suit.DIAMOND }
+            if (d3 != null && (decision == null || decision.cards.none { it.id == d3.id })) {
+                decision = CardGroup(CardType.SINGLE, 3, 1, listOf(d3), d3.suit.order)
+            }
+        }
+
+        // 顶大：下家报单时，AI 若出单张就必须出最大单张
+        if (decision != null && decision.type == CardType.SINGLE && mustTopBig(playerIndex)) {
+            val max = player.handCards
+                .maxWithOrNull(compareBy({ it.rank }, { it.suit.order }))
+            if (max != null && decision.cards.single().id != max.id) {
+                decision = CardGroup(CardType.SINGLE, max.rank, 1, listOf(max), max.suit.order)
+            }
+        }
+
         if (decision != null && decision.type != CardType.INVALID) {
             processPlay(playerIndex, decision.cards, decision)
             return
         }
         if (stateMachine.mustPlay()) {
-            val fallback = player.handCards.minWithOrNull(
-                compareBy({ it.rank }, { it.suit.order })
-            )
+            // 必须出牌时的兜底：顶大义务下改出最大单张，避免兜底小牌违规
+            val fallback = if (mustTopBig(playerIndex)) {
+                player.handCards.maxWithOrNull(compareBy({ it.rank }, { it.suit.order }))
+            } else {
+                player.handCards.minWithOrNull(compareBy({ it.rank }, { it.suit.order }))
+            }
             if (fallback != null) {
                 val single = CardGroup(
                     CardType.SINGLE, fallback.rank, 1,
@@ -299,6 +385,7 @@ class GameEngine {
                 return
             }
         }
+        recordTopBigFailIfNeeded(playerIndex)
         processPass(playerIndex)
     }
 
@@ -321,6 +408,9 @@ class GameEngine {
 
     /** 获取某玩家的合法剩余手牌数 */
     fun getCardCount(index: Int): Int = legalCardCount(index)
+
+    /** 顶大失职玩家索引（结算用）：-1 表示本轮无失职 */
+    val topBigFailIndex: Int get() = stateMachine.topBigFailIndex
 
     /**
      * 我方未见各点数剩余张数：每点数共 4 张 − 自己手牌 − 已打出
@@ -345,7 +435,10 @@ class GameEngine {
             lastPlay = stateMachine.lastPlayedGroup,
             lastPlayerIndex = stateMachine.lastPlayedPlayerIndex,
             passes = stateMachine.passCount,
-            currentPlayerIndex = stateMachine.currentPlayerIndex
+            currentPlayerIndex = stateMachine.currentPlayerIndex,
+            // 把流程性规则一并交给搜索，避免搜出的最优解被下面的兜底逻辑改写
+            mustContainDiamond3 = isDiamond3LeadRequired(),
+            mustTopBig = mustTopBig(myIndex)
         )
 
     // ============================ 提示 ============================
@@ -368,11 +461,23 @@ class GameEngine {
             AIDecision.decide(
                 hand = hand,
                 lastPlay = lastPlay,
-                difficulty = Difficulty.NORMAL,
-                myIndex = 0,
                 opponentCardCounts = getOpponentCardCounts(0),
-                unseenCounts = getUnseenRankCounts(0)
+                unseenCounts = getUnseenRankCounts(0),
+                requireDiamond3 = isDiamond3LeadRequired(),
+                mustTopBig = mustTopBig(0)
             )
+        }
+
+        // 流程性约束：首手必须带方块 3；顶大时若出单张必须最大
+        if (isDiamond3LeadRequired()) {
+            val d3 = hand.firstOrNull { it.rank == 3 && it.suit == Suit.DIAMOND }
+            if (d3 != null && (decision == null || decision.cards.none { it.id == d3.id })) {
+                return listOf(d3)
+            }
+        }
+        if (decision != null && decision.type == CardType.SINGLE && mustTopBig(0)) {
+            val max = hand.maxWithOrNull(compareBy({ it.rank }, { it.suit.order }))
+            if (max != null) return listOf(max)
         }
 
         if (decision != null && decision.type != CardType.INVALID) return decision.cards
@@ -380,8 +485,12 @@ class GameEngine {
         // 自由出牌（无上一手）且启发式未给决策时，兜底提示最小单张；
         // 跟牌情境下若启发式判定「过牌」更优（decision==null），则尊重该判断，提示「不出」。
         if (lastPlay == null) {
-            val minCard = hand.minWithOrNull(compareBy({ it.rank }, { it.suit.order }))
-            if (minCard != null) return listOf(minCard)
+            val card = if (mustTopBig(0)) {
+                hand.maxWithOrNull(compareBy({ it.rank }, { it.suit.order }))
+            } else {
+                hand.minWithOrNull(compareBy({ it.rank }, { it.suit.order }))
+            }
+            if (card != null) return listOf(card)
         }
         return null
     }

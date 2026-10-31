@@ -10,7 +10,7 @@ import com.chudad.game.model.CardGroup
  * 自身先出完概率」的独立视角（非两队零和）。
  *
  * 决策核心为 [MasterSearch] 的 4 人完美信息搜索：位压缩覆盖 4 家手牌，
- * 走法生成覆盖锄大D 全部牌型（含葫芦/四带一/同花顺），评估为「手数竞速 + 牌质」，
+ * 走法生成覆盖锄大D 全部牌型（含顺子/同花五/葫芦/四带一/同花顺），评估为「手数竞速 + 牌质」，
  * 采用 alpha-beta + 置换表 + 迭代加深。搜索无可行解或超时回退到普通模式
  * 启发式 [AIDecision]，保证大师模式始终可完整对局。
  */
@@ -24,6 +24,8 @@ object MasterAIDecision {
      * @param lastPlayerIndex 上一手出牌玩家索引（-1 表示新一轮自由出牌）
      * @param passes 自上一手以来的过牌数（接力轮转用，来自状态机 passCount）
      * @param currentPlayerIndex 当前轮到谁（必等于 [myIndex]）
+     * @param mustContainDiamond3 本手是否必须包含方块 3（整场第一局首手）
+     * @param mustTopBig 下家是否已报单（顶大义务：出单张须为手中最大）
      */
     data class Snapshot(
         val myIndex: Int,
@@ -31,20 +33,24 @@ object MasterAIDecision {
         val lastPlay: CardGroup?,
         val lastPlayerIndex: Int,
         val passes: Int = 0,
-        val currentPlayerIndex: Int
+        val currentPlayerIndex: Int,
+        val mustContainDiamond3: Boolean = false,
+        val mustTopBig: Boolean = false
     )
 
     /**
      * 决策入口
      * @param snapshot 全量快照（4 家手牌）
-     * @param deadlineMs 搜索时长预算（毫秒）
+     * @param deadlineMs 搜索时长预算（毫秒）——迭代加深会持续到该预算耗尽
      * @param nodeLimit 搜索节点预算
+     * @param cancelled 取消判定（重开局后旧搜索应尽快退出，避免占用后台线程）
      * @return 决定出的牌组；null 表示过牌
      */
     fun decide(
         snapshot: Snapshot,
         deadlineMs: Long = 250L,
-        nodeLimit: Int = 500_000
+        nodeLimit: Int = 500_000,
+        cancelled: () -> Boolean = { false }
     ): CardGroup? {
         val hand = snapshot.hands[snapshot.myIndex] ?: return null
         if (hand.isEmpty()) return null
@@ -59,7 +65,10 @@ object MasterAIDecision {
                 passes = snapshot.passes,
                 current = snapshot.currentPlayerIndex,
                 deadlineMs = deadlineMs,
-                nodeLimit = nodeLimit
+                nodeLimit = nodeLimit,
+                mustContainDiamond3 = snapshot.mustContainDiamond3,
+                mustTopBig = snapshot.mustTopBig,
+                cancelled = cancelled
             )
             if (result != null) return result                 // 搜索给出的一手出牌
             if (snapshot.lastPlay != null) return null        // 跟牌且搜索判「过牌」最优 → 过牌
@@ -84,7 +93,9 @@ object MasterAIDecision {
             hand = hand,
             lastPlay = snapshot.lastPlay,
             opponentCardCounts = opponentCardCounts,
-            unseenCounts = unseenCounts
+            unseenCounts = unseenCounts,
+            requireDiamond3 = snapshot.mustContainDiamond3,
+            mustTopBig = snapshot.mustTopBig
         )
     }
 }

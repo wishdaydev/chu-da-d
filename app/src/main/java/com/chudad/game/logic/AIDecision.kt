@@ -3,6 +3,7 @@ package com.chudad.game.logic
 import com.chudad.game.model.Card
 import com.chudad.game.model.CardGroup
 import com.chudad.game.model.CardType
+import com.chudad.game.model.Suit
 
 /**
  * 普通模式 AI（启发式规则）—— 锄大D 版
@@ -36,18 +37,43 @@ object AIDecision {
      * @param lastPlay 上一手牌（null 表示自由出牌）
      * @param opponentCardCounts 其余 3 家的手牌数
      * @param unseenCounts 我方未见各点数剩余张数（下标即 rank）
+     * @param requireDiamond3 本手是否必须包含方块 3（整场第一局首手）
+     * @param mustTopBig 下家是否已报单（顶大义务：出单张须为手中最大）
      * @return 决定出的牌组；null 表示过牌
      */
     fun decide(
         hand: List<Card>,
         lastPlay: CardGroup?,
         opponentCardCounts: IntArray,
-        unseenCounts: IntArray
+        unseenCounts: IntArray,
+        requireDiamond3: Boolean = false,
+        mustTopBig: Boolean = false
     ): CardGroup? {
         if (hand.isEmpty()) return null
 
-        val legal = CardRuleEngine.findAllValidPlays(hand, lastPlay)
+        var legal = CardRuleEngine.findAllValidPlays(hand, lastPlay)
         if (legal.isEmpty()) return null
+
+        // 流程性约束：先把手牌候选收窄到规则允许的范围，避免策略判断被引擎兜底覆盖
+        if (requireDiamond3) {
+            val d3Id = hand.firstOrNull { it.rank == 3 && it.suit == Suit.DIAMOND }?.id
+            if (d3Id != null) {
+                val withD3 = legal.filter { g -> g.cards.any { it.id == d3Id } }
+                legal = withD3.ifEmpty {
+                    val d3 = hand.first { it.id == d3Id }
+                    listOf(CardGroup(CardType.SINGLE, 3, 1, listOf(d3), d3.suit.order))
+                }
+            }
+        }
+        if (mustTopBig) {
+            val max = hand.maxWithOrNull(compareBy({ it.rank }, { it.suit.order }))
+            if (max != null) {
+                val topOnly = legal.filter { g ->
+                    g.type != CardType.SINGLE || g.cards.singleOrNull()?.id == max.id
+                }
+                if (topOnly.isNotEmpty()) legal = topOnly
+            }
+        }
 
         // 能一把出完 → 直接获胜
         legal.firstOrNull { it.cards.size == hand.size }?.let { return it }
@@ -74,14 +100,16 @@ object AIDecision {
      * 首出打分（越大越优先）：
      *  - 多出牌加分（尽快消耗手牌）
      *  - 主牌点数越小越优先（保存大牌后手）
-     *  - 动用 2 / 强牌 重罚
+     *  - 动用 2 / 重牌 重罚；同花五作为五张中层牌型轻罚
      *  - 已「未见最大」的单牌额外加分（出出去无人能压，稳赚一手）
      */
     private fun scoreLead(g: CardGroup, hand: List<Card>, unseenCounts: IntArray): Int {
         var s = g.cards.size * 5
         s -= g.mainRank
 
-        if (g.cards.any { it.rank == RANK_TWO }) s -= 25
+        // 只判主体点数：A-2-3-4-5 顺子的主体是 5，虽含 2 却是最小顺子，不该被罚
+        if (g.mainRank == RANK_TWO) s -= 25
+        if (g.type == CardType.FLUSH) s -= 18
         if (g.type == CardType.FOUR_WITH_ONE) s -= 45
         if (g.type == CardType.STRAIGHT_FLUSH) s -= 45
 
@@ -120,14 +148,14 @@ object AIDecision {
             it.type != CardType.FOUR_WITH_ONE && it.type != CardType.STRAIGHT_FLUSH
         }
 
-        // 1) 优先用「不含 2」的最便宜牌跟牌
-        val cheap = normal.filter { !it.cards.any { c -> c.rank == RANK_TWO } }
+        // 1) 优先用「主体不是 2」的最便宜牌跟牌
+        val cheap = normal.filter { it.mainRank != RANK_TWO }
         if (cheap.isNotEmpty()) return cheap.minByOrNull { cost(it, hand) }
 
         // 2) 紧急（对手即将出完）：允许动用 2
         if (urgent && normal.isNotEmpty()) return normal.minByOrNull { cost(it, hand) }
 
-        // 3) 紧急且只能靠强牌拦截：动用四带一/同花顺
+        // 3) 紧急且只能靠重牌拦截：动用四带一/同花顺
         if (urgent && bombs.isNotEmpty()) return bombs.minByOrNull { cost(it, hand) }
 
         // 4) 不紧急：保存实力，过牌
@@ -137,14 +165,24 @@ object AIDecision {
     /**
      * 跟牌代价（越小越优先）：
      *  - 主牌点数越大代价越高（尽量用最小牌恰好压住）
-     *  - 动用 2 重罚
+     *  - 同张数下跨牌型时按牌型层级加价（能出顺子就不出葫芦，保留更强牌型）
+     *  - 主体点数为 2 重罚
      *  - 拆散对子/三条/四条结构有额外惩罚
      */
     private fun cost(g: CardGroup, hand: List<Card>): Int {
-        var c = g.mainRank * 2
-        if (g.cards.any { it.rank == RANK_TWO }) c += 30
+        var c = g.mainRank * 2 + typeSurcharge(g.type)
+        if (g.mainRank == RANK_TWO) c += 30
         c += breakPenalty(g, hand)
         return c
+    }
+
+    /** 牌型层级加价：层级越高越舍不得用（仅五张牌型会真正跨型比较） */
+    private fun typeSurcharge(type: CardType): Int = when (type) {
+        CardType.FLUSH -> 10
+        CardType.FULL_HOUSE -> 18
+        CardType.FOUR_WITH_ONE -> 45
+        CardType.STRAIGHT_FLUSH -> 50
+        else -> 0          // 单张 / 对子 / 三条 / 顺子
     }
 
     /**

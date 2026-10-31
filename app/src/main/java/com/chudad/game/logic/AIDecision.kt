@@ -20,7 +20,7 @@ import com.chudad.game.model.Suit
  *  【跟牌】
  *   - 能一把出完则出完
  *   - 用「恰好压住」的最小代价牌跟牌，避免浪费大牌
- *   - 有对手接近出完（手牌 ≤2）时转为激进：允许动用 2 / 四带一·同花顺等强牌拦截
+ *   - 下家报单（≤2 张）或任意对手只剩 1 张时转为激进：允许动用 2 / 四带一·同花顺等强牌拦截
  *   - 不紧急时，若只能用 2 或四带一·同花顺等强牌才能压上，则选择过牌保存实力
  */
 object AIDecision {
@@ -33,6 +33,9 @@ object AIDecision {
 
     /** 顺子固定长度（与 CardRuleEngine 一致） */
     private const val STRAIGHT_LEN = 5
+
+    /** A-2-3-4-5 轮式顺子的点数序列（14=A、15=2） */
+    private val A2345 = listOf(3, 4, 5, 14, 15)
 
     /** 首出打分中「出完该手后剩余手数」的权重（每多一手扣该值） */
     private const val HAND_COST = 20
@@ -85,7 +88,7 @@ object AIDecision {
         legal.firstOrNull { it.cards.size == hand.size }?.let { return it }
 
         return if (lastPlay == null || lastPlay.type == CardType.INVALID) {
-            freeLead(hand, legal, unseenCounts)
+            freeLead(hand, legal, unseenCounts, opponentCardCounts.getOrElse(0) { 13 })
         } else {
             follow(hand, legal, opponentCardCounts)
         }
@@ -96,10 +99,11 @@ object AIDecision {
     private fun freeLead(
         hand: List<Card>,
         legal: List<CardGroup>,
-        unseenCounts: IntArray
+        unseenCounts: IntArray,
+        nextCards: Int
     ): CardGroup? {
         if (legal.isEmpty()) return null
-        return legal.maxByOrNull { scoreLead(it, hand, unseenCounts) }
+        return legal.maxByOrNull { scoreLead(it, hand, unseenCounts, nextCards) }
     }
 
     /**
@@ -109,8 +113,9 @@ object AIDecision {
      *  - 出完该手后「剩余手数」越少越好（避免为多出一张而拆散能一次走完的结构）
      *  - 动用 2 / 重牌 重罚；同花五作为五张中层牌型轻罚
      *  - 已「未见最大」的单牌额外加分（出出去无人能压，稳赚一手）
+     *  - 下家报单（1~2 张）时压低单张，避免送对手直接出完
      */
-    private fun scoreLead(g: CardGroup, hand: List<Card>, unseenCounts: IntArray): Int {
+    private fun scoreLead(g: CardGroup, hand: List<Card>, unseenCounts: IntArray, nextCards: Int): Int {
         var s = g.cards.size * 5
         s -= g.mainRank
 
@@ -119,6 +124,15 @@ object AIDecision {
         if (g.type == CardType.FLUSH) s -= 18
         if (g.type == CardType.FOUR_WITH_ONE) s -= 45
         if (g.type == CardType.STRAIGHT_FLUSH) s -= 45
+
+        // 下家报单的保护：下家只剩 1 张时出单张＝把出完机会直接送给他（他一压就赢），
+        // 必须优先出对子/三条/顺子等「他单张压不动」的牌型；若只能出单张，则出点数最大的那张。
+        if (nextCards == 1 && g.type == CardType.SINGLE) {
+            s += g.mainRank * 3 - 70
+        } else if (nextCards == 2 && g.type == CardType.SINGLE) {
+            // 下家 2 张很可能是一对：单张同样容易被接走，轻度回避
+            s -= 25
+        }
 
         // 拆散牌型结构的惩罚（拆对子/三条/四条）
         s -= breakPenalty(g, hand)
@@ -141,23 +155,82 @@ object AIDecision {
 
     /**
      * 剩余手牌的最小手数估算（贪心下界）：
-     *  - 同点数 ≥2 张合并为 1 手（对子/三条/四条）
-     *  - 散牌中每凑成一个 5 连顺子，5 手并成 1 手
-     * 不计 A-2-3-4-5 与同花类牌型，属保守估算，只用于比较不同出牌的相对优劣。
+     *  - 先抽顺子（含 A-2-3-4-5 轮式）：5 张并成 1 手。允许从对子/三条里拆 1 张凑顺，
+     *    但优先选「不需要拆桶」的窗口、同等条件取点数更大的窗口（大牌先消耗、小牌留作顺子成本低）
+     *  - 剩余按同点数合并：四条 / 三条 / 对子各 1 手
+     *  - 葫芦（3+2）、四带一（4+1）各并成 1 手
+     * 不计同花与同花顺，属保守估算，只用于比较不同出牌的相对优劣。
+     *
+     * 旧实现只从「单张点数」里找顺子，导致 5,6,7,8,9,9 这种「对子可拆出一张成顺」的手牌
+     * 被估成 5 手（实际 2 手），首出/跟牌打分因此系统性偏向错误方案。
      */
     private fun estimateHands(cards: List<Card>): Int {
         if (cards.isEmpty()) return 0
-        val byRank = cards.groupingBy { it.rank }.eachCount()
-        var hands = byRank.size
-        val singles = byRank.filterValues { it == 1 }.keys.sorted()
-        var i = 0
-        while (i < singles.size) {
-            var j = i
-            while (j + 1 < singles.size && singles[j + 1] == singles[j] + 1) j++
-            hands -= ((j - i + 1) / STRAIGHT_LEN) * (STRAIGHT_LEN - 1)
-            i = j + 1
+        val cnt = IntArray(16)
+        for (c in cards) cnt[c.rank]++
+
+        var hands = 0
+        // 1) 反复抽顺子（每抽一个 5 连，手数 +1）
+        while (true) {
+            val window = pickStraight(cnt) ?: break
+            for (r in window) cnt[r]--
+            hands++
         }
+
+        // 2) 剩余按同点数归并
+        var fours = 0
+        var triples = 0
+        var pairs = 0
+        var singles = 0
+        for (r in 3..15) {
+            when (cnt[r]) {
+                4 -> fours++
+                3 -> triples++
+                2 -> pairs++
+                1 -> singles++
+            }
+        }
+        hands += fours
+        // 四带一：4+1 并成 1 手（四条已计 1 手；被带走的单张不再单独计入）
+        val fourWithOne = minOf(fours, singles)
+        singles -= fourWithOne
+        // 葫芦：3+2 并成 1 手（三条与对子此前都未计入，合并后计 1 手）
+        val fullHouse = minOf(triples, pairs)
+        triples -= fullHouse
+        pairs -= fullHouse
+        hands += fullHouse
+        hands += triples + pairs + singles
         return hands
+    }
+
+    /**
+     * 从点数计数里挑一个可出的顺子窗口：
+     * 优先「不拆对子/三条」（窗口内各点数都只用 1 张），同等拆桶代价下取点数更大的窗口
+     * （把 4-8 留给顺子比 3-7 更划算，小牌单独出更容易被放走）。
+     */
+    private fun pickStraight(cnt: IntArray): IntArray? {
+        var best: IntArray? = null
+        var bestCost = Int.MAX_VALUE
+        for (start in 10 downTo 3) {
+            var ok = true
+            var cost = 0
+            for (r in start until start + STRAIGHT_LEN) {
+                if (cnt[r] <= 0) { ok = false; break }
+                if (cnt[r] > 1) cost++
+            }
+            if (!ok) continue
+            if (cost < bestCost) {
+                bestCost = cost
+                best = IntArray(STRAIGHT_LEN) { start + it }
+                if (cost == 0) return best   // 无需拆桶即最优，提前返回（保留最大窗口）
+            }
+        }
+        // A-2-3-4-5 轮式：是最小顺子，只在「比常规窗口更省」时采纳，避免抢走 4-8 之类更实用的窗口
+        if (A2345.all { cnt[it] > 0 }) {
+            val cost = A2345.count { cnt[it] > 1 }
+            if (cost < bestCost) best = A2345.toIntArray()
+        }
+        return best
     }
 
     /** 该单张是否已是「未见牌中最大的」：更高点数已全部现出 */
@@ -176,8 +249,13 @@ object AIDecision {
         legal: List<CardGroup>,
         opponentCardCounts: IntArray
     ): CardGroup? {
-        val minOppCards = opponentCardCounts.minOrNull() ?: 13
-        val urgent = minOppCards <= URGENT_OPPONENT_CARDS
+        // 紧迫性只认「下家近出完」与「任何一家只剩 1 张」：
+        //  - 下家 ≤2 张时我若过牌，等于把上手机会直接让给他；
+        //  - 其他对手剩 2 张时贸然动用 2/重牌去压往往是白送大牌（他这一手未必轮得到出），
+        //    但只剩 1 张就不同——他一旦拿到牌权就直接赢，必须尽力拦。
+        // 旧实现用「全场最小手牌数 ≤2」触发，等于任意一家接近出完都激进，浪费大牌。
+        val nextCards = opponentCardCounts.getOrElse(0) { 13 }
+        val urgent = nextCards <= URGENT_OPPONENT_CARDS || opponentCardCounts.any { it <= 1 }
 
         val bombs = legal.filter {
             it.type == CardType.FOUR_WITH_ONE || it.type == CardType.STRAIGHT_FLUSH

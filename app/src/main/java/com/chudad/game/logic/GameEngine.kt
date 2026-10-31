@@ -13,7 +13,7 @@ import com.chudad.game.state.PLAYER_COUNT
 
 /**
  * 游戏引擎回调接口
- * 用于通知 UI 层游戏状态变化（锄大D：无叫分/无地主）
+ * 用于通知 UI 层游戏状态变化（锄大D：发牌即进入出牌）
  */
 interface GameEngineCallback {
     /** 发牌完成（UI 触发手牌展示动画，动画结束后调用 beginPlaying） */
@@ -55,7 +55,7 @@ class GameEngine {
 
     /**
      * 大师模式下「电脑玩家是否使用全信息搜索」策略。
-     * 锄大D 为四人各自为战、无队友概念：大师模式中三个电脑玩家出牌是否走
+     * 锄大D 为四人各自为战：大师模式中三个电脑玩家出牌是否走
      * 完美信息搜索（开启=全开挂，关闭=走普通启发式）。
      */
     var aiMasterStrategy: Difficulty = Difficulty.NORMAL

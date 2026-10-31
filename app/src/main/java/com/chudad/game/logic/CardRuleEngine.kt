@@ -22,7 +22,7 @@ import com.chudad.game.model.Suit
  *
  * 三、跟牌规则
  *   - 必须同牌型、同长度且更大（顺子/同花顺长度须一致，比较最大牌）
- *   - 炸弹例外：四带一可压任意「非同花顺」牌型；同花顺可压任意「非同花顺」牌型
+ *   - 强牌例外：四带一可压任意「非同花顺」牌型；同花顺可压任意「非同花顺」牌型
  *   - 同花顺之间：须同长度且更大
  */
 object CardRuleEngine {
@@ -155,7 +155,7 @@ object CardRuleEngine {
         // 上家是同花顺：只能被更高同花顺压
         if (lastPlay.type == CardType.STRAIGHT_FLUSH) return false
 
-        // 四带一：炸弹，可压任意非同花顺牌型；四带一之间比四条点数
+        // 四带一：可压任意非同花顺牌型；四带一之间比四条点数
         if (played.type == CardType.FOUR_WITH_ONE) {
             return if (lastPlay.type == CardType.FOUR_WITH_ONE) {
                 compare(played, lastPlay) > 0
@@ -239,9 +239,9 @@ object CardRuleEngine {
             else -> {}
         }
 
-        // 炸弹补充：上家不是同花顺时，四带一/同花顺 均可压
+        // 强牌补充：上家不是同花顺时，四带一/同花顺 均可压
         if (lastPlay.type != CardType.STRAIGHT_FLUSH) {
-            // 四带一：若上家不是四带一，任意四带一都可压（炸弹）
+            // 四带一：若上家不是四带一，任意四带一都可压（本游戏最强牌型之一）
             if (lastPlay.type != CardType.FOUR_WITH_ONE) {
                 results.addAll(genFourWithOne(sorted))
             }

@@ -6,7 +6,7 @@ import com.chudad.game.model.CardType
 
 /**
  * 游戏状态枚举
- * 锄大D 无叫分/无地主流程：发牌后直接出牌，先出完手牌者胜。
+ * 锄大D 流程：发牌后直接出牌，先出完手牌者胜。
  */
 enum class GamePhase {
     MENU,           // 主界面（难度选择）
@@ -43,9 +43,6 @@ class GameStateMachine {
     /** 出牌记录（玩家索引 + 所出牌） */
     val playHistory: MutableList<Pair<Int, List<Card>>> = mutableListOf()
 
-    /** 本局强牌次数（四带一 / 同花顺），仅用于展示，不参与计分（锄大D 无炸弹翻倍） */
-    var strongPlayCount: Int = 0
-
     /** 胜负已定时的获胜玩家索引（-1 表示未定） */
     var winnerIndex: Int = -1
 
@@ -59,7 +56,6 @@ class GameStateMachine {
         lastPlayedPlayerIndex = -1
         passCount = 0
         playHistory.clear()
-        strongPlayCount = 0
         winnerIndex = -1
     }
 
@@ -70,7 +66,6 @@ class GameStateMachine {
         lastPlayedPlayerIndex = -1
         passCount = 0
         playHistory.clear()
-        strongPlayCount = 0
         winnerIndex = -1
     }
 
@@ -98,10 +93,6 @@ class GameStateMachine {
         lastPlayedGroup = group
         lastPlayedPlayerIndex = playerIndex
         passCount = 0
-        // 统计强牌（四带一 / 同花顺）
-        if (group.type == CardType.FOUR_WITH_ONE || group.type == CardType.STRAIGHT_FLUSH) {
-            strongPlayCount++
-        }
         playHistory.add(Pair(playerIndex, group.cards))
         return nextPlayer(playerIndex)
     }

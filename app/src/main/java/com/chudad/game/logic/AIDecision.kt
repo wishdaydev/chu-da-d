@@ -8,7 +8,7 @@ import com.chudad.game.model.Difficulty
 /**
  * 普通模式 AI（启发式规则）—— 锄大D 版
  *
- * 锄大D 为 4 人各自为战，不存在地主/农民、队友、控牌(2/王)与叫分等概念，
+ * 锄大D 为 4 人各自为战，不存在阵营、队友、叫分等概念，
  * AI 采用「四人博弈下的通用直觉」：
  *
  *  【自由出牌】
@@ -20,8 +20,8 @@ import com.chudad.game.model.Difficulty
  *  【跟牌】
  *   - 能一把出完则出完
  *   - 用「恰好压住」的最小代价牌跟牌，避免浪费大牌
- *   - 有对手接近出完（手牌 ≤2）时转为激进：允许动用 2 / 炸弹拦截
- *   - 不紧急时，若只能用 2 或炸弹才能压上，则选择过牌保存实力
+ *   - 有对手接近出完（手牌 ≤2）时转为激进：允许动用 2 / 四带一·同花顺等强牌拦截
+ *   - 不紧急时，若只能用 2 或四带一·同花顺等强牌才能压上，则选择过牌保存实力
  */
 object AIDecision {
 
@@ -79,7 +79,7 @@ object AIDecision {
      * 首出打分（越大越优先）：
      *  - 多出牌加分（尽快消耗手牌）
      *  - 主牌点数越小越优先（保存大牌后手）
-     *  - 动用 2 / 炸弹 重罚
+     *  - 动用 2 / 强牌 重罚
      *  - 已「未见最大」的单牌额外加分（出出去无人能压，稳赚一手）
      */
     private fun scoreLead(g: CardGroup, hand: List<Card>, unseenCounts: IntArray): Int {
@@ -132,7 +132,7 @@ object AIDecision {
         // 2) 紧急（对手即将出完）：允许动用 2
         if (urgent && normal.isNotEmpty()) return normal.minByOrNull { cost(it, hand) }
 
-        // 3) 紧急且只能靠炸弹拦截：动用炸弹
+        // 3) 紧急且只能靠强牌拦截：动用四带一/同花顺
         if (urgent && bombs.isNotEmpty()) return bombs.minByOrNull { cost(it, hand) }
 
         // 4) 不紧急：保存实力，过牌

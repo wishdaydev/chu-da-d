@@ -61,26 +61,8 @@ REAL_ERRORS=$(echo "$ERRORS" | grep -E "^.*\.kt:[0-9]+:" \
     | grep -v "unresolved reference: setContentView" \
     | grep -v "unresolved reference: requestWindowFeature" \
     | grep -v "unresolved reference: runOnUiThread" \
-    | grep -v "unresolved reference: updateScoresOnUiThread" \
-    | grep -v "unresolved reference: binding" \
-    | grep -v "unresolved reference: player2Avatar" \
-    | grep -v "unresolved reference: player3Avatar" \
-    | grep -v "unresolved reference: player1Score" \
-    | grep -v "unresolved reference: player2Score" \
-    | grep -v "unresolved reference: player3Score" \
-    | grep -v "unresolved reference: player1Bet" \
-    | grep -v "unresolved reference: player2Bet" \
-    | grep -v "unresolved reference: player3Bet" \
     | grep -v "unresolved reference: GameSurfaceView" \
-    | grep -v "unresolved reference: GameViewModel" \
-    | grep -v "unresolved reference: BottomCardAreaView" \
-    | grep -v "unresolved reference: PlayerCardView" \
     | grep -v "unresolved reference: view" \
-    | grep -v "unresolved reference: chips" \
-    | grep -v "unresolved reference: showChosenLandlord" \
-    | grep -v "unresolved reference: showFarmerMessage" \
-    | grep -v "unresolved reference: playLandlordAnimation" \
-    | grep -v "unresolved reference: hideActions" \
     | grep -v "unresolved reference: playCardSound" \
     | grep -v "'when' expression must be exhaustive" \
     | grep -v "cannot access class" \

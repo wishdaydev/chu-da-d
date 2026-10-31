@@ -29,7 +29,7 @@ import kotlin.concurrent.thread
  * 锄大D 游戏主 Activity
  * 使用 SurfaceView 进行 Canvas 绘制，实现完整的游戏 UI。
  *
- * 无叫分/无地主流程，发牌动画结束后直接进入出牌阶段；
+ * 发牌动画结束后直接进入出牌阶段；
  * 统计按模式（普通/大师）独立，不区分子角色；大师策略表示「电脑是否全信息搜索」。
  */
 class MainActivity : AppCompatActivity(), GameEngineCallback {
@@ -78,8 +78,7 @@ class MainActivity : AppCompatActivity(), GameEngineCallback {
     /**
      * 大师模式 AI 策略持久化（独立文件，与普通统计无关）
      *
-     * 说明：存储键沿用旧名 `farmer_teammate_strategy` 以保持备份文件兼容，
-     * 但其语义已重定义为「大师模式下电脑玩家是否使用全信息搜索」
+     * 存储键 `master_ai_strategy` 表示「大师模式下电脑玩家是否使用全信息搜索」
      * （锄大D 四人各自为战，不存在队友概念）。
      */
     private val strategyPrefs by lazy { getSharedPreferences("master_strategy", MODE_PRIVATE) }
@@ -93,14 +92,14 @@ class MainActivity : AppCompatActivity(), GameEngineCallback {
     }
 
     private fun loadMasterStrategy() {
-        aiMasterStrategy = loadStrategy("farmer_teammate_strategy", Difficulty.NORMAL)
+        aiMasterStrategy = loadStrategy("master_ai_strategy", Difficulty.NORMAL)
         playerHintStrategy = loadStrategy("player_hint_strategy", Difficulty.NORMAL)
         masterThinkSeconds = strategyPrefs.getInt("master_think_seconds", 5)
     }
 
     private fun saveMasterStrategy() {
         strategyPrefs.edit().apply {
-            putString("farmer_teammate_strategy", aiMasterStrategy.name)
+            putString("master_ai_strategy", aiMasterStrategy.name)
             putString("player_hint_strategy", playerHintStrategy.name)
             putInt("master_think_seconds", masterThinkSeconds)
             apply()
@@ -135,7 +134,7 @@ class MainActivity : AppCompatActivity(), GameEngineCallback {
         root.put("appVersion", BuildConfig.VERSION_NAME)
         root.put("exportedAt", SimpleDateFormat("yyyyMMddHHmm", Locale.getDefault()).format(Date()))
         val settings = JSONObject()
-        settings.put("farmer_teammate_strategy", aiMasterStrategy.name)
+        settings.put("master_ai_strategy", aiMasterStrategy.name)
         settings.put("player_hint_strategy", playerHintStrategy.name)
         settings.put("masterThinkSeconds", masterThinkSeconds)
         root.put("settings", settings)
@@ -162,7 +161,7 @@ class MainActivity : AppCompatActivity(), GameEngineCallback {
         val schema = root.optInt("schema", 1)
         if (schema !in 1..2) throw IllegalArgumentException("不支持的备份格式")
         val settings = root.getJSONObject("settings")
-        val aiMaster = Difficulty.valueOf(settings.optString("farmer_teammate_strategy", Difficulty.NORMAL.name))
+        val aiMaster = Difficulty.valueOf(settings.optString("master_ai_strategy", Difficulty.NORMAL.name))
         val hint = Difficulty.valueOf(settings.optString("player_hint_strategy", Difficulty.NORMAL.name))
         val sec = settings.optInt("masterThinkSeconds", 5).coerceIn(2, 60)
         val statsObj = root.optJSONObject("stats") ?: JSONObject()
@@ -371,7 +370,7 @@ class MainActivity : AppCompatActivity(), GameEngineCallback {
 
     override fun onDealingComplete() {
         runOnUiThread {
-            // 3 秒手牌逐张滑入动画；动画结束后直接进入出牌阶段（锄大D 无叫分流程）
+            // 3 秒手牌逐张滑入动画；动画结束后直接进入出牌阶段
             gameSurfaceView.startHandReveal {
                 gameEngine.beginPlaying()
             }
@@ -385,10 +384,10 @@ class MainActivity : AppCompatActivity(), GameEngineCallback {
     override fun onPlayerPlay(playerIndex: Int, cards: List<Card>, group: CardGroup) {
         runOnUiThread {
             gameSurfaceView.setTablePlayedCards(playerIndex, cards)
-            // 四带一 / 同花顺 是锄大D 中的强力牌型，用重音效；其余用普通甩牌声（锄大D 无"炸弹"概念）
+            // 四带一 / 同花顺 是锄大D 中的强力牌型，用重音效；其余用普通甩牌声
             val isStrong = group.type == CardType.FOUR_WITH_ONE ||
                     group.type == CardType.STRAIGHT_FLUSH
-            gameSurfaceView.playCardSound(isBomb = isStrong)
+            gameSurfaceView.playCardSound(isStrong = isStrong)
 
             val isLastCard = gameEngine.players[playerIndex].handCards.size == 1
             val isBig = isStrong || cards.size >= 5
@@ -417,7 +416,7 @@ class MainActivity : AppCompatActivity(), GameEngineCallback {
             // 锄大D 积分（剩余张数累计法）：
             // 赢家收取其余各家剩余手牌数之和。人类赢 → 加「其余三家剩余张数之和」；
             // 人类输 → 扣「自身剩余张数」（即应支付给赢家的牌数）。
-            // 积分采用剩余张数累计法（四带一/同花顺为正常牌型，无炸弹翻倍）。
+            // 积分采用剩余张数累计法（四带一/同花顺为正常牌型，不计额外倍数）。
             val playerCount = gameEngine.players.size
             val remaining = IntArray(playerCount) { gameEngine.getCardCount(it) }
             val humanRemaining = remaining[0]

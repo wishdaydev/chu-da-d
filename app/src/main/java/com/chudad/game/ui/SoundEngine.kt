@@ -79,8 +79,8 @@ class SoundEngine {
         sweepNoise(durSec = 0.13, fStart = 5200.0, fEnd = 1500.0, gain = 0.5) + thud(150.0, 0.09, 0.5)
     }
 
-    /** 炸弹/火箭：低频轰鸣 + 渐弱噪声爆炸 */
-    fun bomb() = play(ToneGenerator.TONE_CDMA_ABBR_ALERT, 300) {
+    /** 四带一/同花顺：低频轰鸣 + 渐弱噪声爆炸 */
+    fun strongPlay() = play(ToneGenerator.TONE_CDMA_ABBR_ALERT, 300) {
         val boom = DoubleArray((sampleRate * 0.55).toInt())
         // 低频冲击
         addInto(boom, thud(55.0, 0.45, 0.95))
@@ -117,7 +117,7 @@ class SoundEngine {
         concat(thud(160.0, 0.10, 0.7), offset(thud(140.0, 0.12, 0.7), (sampleRate * 0.13).toInt()))
     }
 
-    /** 叫分/确认：清脆的单击"叮" */
+    /** 确认：清脆的单击"叮" */
     fun confirm() = play(ToneGenerator.TONE_PROP_ACK, 50) { tones(listOf(1046.5 to 0.10)) }
 
     // ==================== 兜底与生命周期 ====================

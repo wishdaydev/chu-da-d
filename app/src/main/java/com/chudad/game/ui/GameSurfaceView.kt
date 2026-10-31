@@ -378,7 +378,7 @@ class GameSurfaceView(context: Context) : SurfaceView(context), SurfaceHolder.Ca
         refresh()
     }
 
-    /** 通用中央提示弹窗（锄大D 无叫分/无地主，仅用于「xx先出牌」等通用提示）：
+    /** 通用中央提示弹窗（仅用于「xx先出牌」等通用提示）：
      *  屏幕正中深色圆角底 + 金色大字，保持指定时长后自动关闭并触发 onDismiss。
      *  @Volatile：绘制线程读取、UI 线程写入；到期清除时须再 refresh 一次，防止静止画面残留。 */
     @Volatile
@@ -467,7 +467,7 @@ class GameSurfaceView(context: Context) : SurfaceView(context), SurfaceHolder.Ca
     private val dragHandled = mutableSetOf<Int>()
 
     /** 按模式分别统计：积分 / 局数 / 胜场（普通、大师各自独立）
-     *  与 MainActivity.GameStats 镜像：锄大D 四人各自为战，无地主/农民之分，故只有总桶。 */
+     *  与 MainActivity.GameStats 镜像：锄大D 四人各自为战，故只有总桶。 */
     private data class ModeStat(
         var score: Int = 0, var games: Int = 0, var wins: Int = 0
     )
@@ -486,7 +486,7 @@ class GameSurfaceView(context: Context) : SurfaceView(context), SurfaceHolder.Ca
     var onResetStats: ((Difficulty) -> Unit)? = null
 
     /** 大师模式 AI 策略（本地显示状态，由 MainActivity 启动时初始化） */
-    private var masterFarmerStrategy: Difficulty = Difficulty.NORMAL
+    private var masterComputerStrategy: Difficulty = Difficulty.NORMAL
     private var masterHintStrategy: Difficulty = Difficulty.NORMAL
     /** 大师模式 AI 最大思考时间（秒），本地显示状态，2~60，默认 5；仅在关闭设置时落盘 */
     private var masterThinkSeconds: Int = 5
@@ -542,7 +542,7 @@ class GameSurfaceView(context: Context) : SurfaceView(context), SurfaceHolder.Ca
     /** 是否正在播放手牌展示动画 */
     @Volatile
     private var isHandReveal = false
-    /** 动画结束回调（由 MainActivity 注入，通常为进入叫分阶段） */
+    /** 动画结束回调（由 MainActivity 注入，通常为进入出牌阶段） */
     @Volatile
     private var onRevealComplete: (() -> Unit)? = null
     /** 发牌动画代次：每次开局自增，防止上一局延迟的结束回调串入下一局 */
@@ -610,7 +610,7 @@ class GameSurfaceView(context: Context) : SurfaceView(context), SurfaceHolder.Ca
         } catch (_: Exception) {}
     }
 
-    /** 大出牌（炸弹/火箭/一次出≥8张）的长振动反馈：0.8 秒（振幅已减半） */
+    /** 大出牌（四带一/同花顺/一次出≥8张）的长振动反馈：0.8 秒（振幅已减半） */
     fun playBigVibration() {
         try {
             val v = vibrator ?: return
@@ -653,14 +653,14 @@ class GameSurfaceView(context: Context) : SurfaceView(context), SurfaceHolder.Ca
         vibrate(VibrationKind.TICK)
     }
 
-    /** 按钮动作确认反馈（叫分/出牌/不出/提示成功时的明确振动） */
+    /** 按钮动作确认反馈（出牌/不出/提示成功时的明确振动） */
     private fun hapticActionConfirm() {
         vibrate(VibrationKind.HEAVY)
     }
 
-    /** 播放出牌音效（按牌型区分：炸弹/火箭为爆炸轰鸣，其余为甩牌"唰"声） */
-    fun playCardSound(isBomb: Boolean = false) {
-        if (isBomb) sfx { it.bomb() } else sfx { it.cardPlay() }
+    /** 播放出牌音效（按牌型区分：四带一/同花顺为爆炸轰鸣，其余为甩牌"唰"声） */
+    fun playCardSound(isStrong: Boolean = false) {
+        if (isStrong) sfx { it.strongPlay() } else sfx { it.cardPlay() }
     }
 
     /** 播放错误音效 */
@@ -914,8 +914,8 @@ class GameSurfaceView(context: Context) : SurfaceView(context), SurfaceHolder.Ca
     }
 
     /** 初始化大师模式 AI 策略的显示状态（由 MainActivity 启动时调用） */
-    fun setMasterStrategy(farmerTeammate: Difficulty, playerHint: Difficulty) {
-        masterFarmerStrategy = farmerTeammate
+    fun setMasterStrategy(computerAi: Difficulty, playerHint: Difficulty) {
+        masterComputerStrategy = computerAi
         masterHintStrategy = playerHint
     }
 
@@ -1283,7 +1283,7 @@ class GameSurfaceView(context: Context) : SurfaceView(context), SurfaceHolder.Ca
             }
             action == "close_settings" -> {
                 // 关闭前持久化保存设置项（大师策略实时落盘；思考时间与之一并落盘）
-                onMasterStrategyChange?.invoke(masterFarmerStrategy, masterHintStrategy)
+                onMasterStrategyChange?.invoke(masterComputerStrategy, masterHintStrategy)
                 onMasterThinkTimeChange?.invoke(masterThinkSeconds)
                 settingsOpen = false
                 confirmResetMode = null
@@ -1321,24 +1321,24 @@ class GameSurfaceView(context: Context) : SurfaceView(context), SurfaceHolder.Ca
                 importConfirmPending = false
                 refresh()
             }
-            action == "master_farmer_normal" -> {
-                masterFarmerStrategy = Difficulty.NORMAL
-                onMasterStrategyChange?.invoke(masterFarmerStrategy, masterHintStrategy)
+            action == "master_ai_normal" -> {
+                masterComputerStrategy = Difficulty.NORMAL
+                onMasterStrategyChange?.invoke(masterComputerStrategy, masterHintStrategy)
                 refresh()
             }
-            action == "master_farmer_master" -> {
-                masterFarmerStrategy = Difficulty.MASTER
-                onMasterStrategyChange?.invoke(masterFarmerStrategy, masterHintStrategy)
+            action == "master_ai_master" -> {
+                masterComputerStrategy = Difficulty.MASTER
+                onMasterStrategyChange?.invoke(masterComputerStrategy, masterHintStrategy)
                 refresh()
             }
             action == "master_hint_normal" -> {
                 masterHintStrategy = Difficulty.NORMAL
-                onMasterStrategyChange?.invoke(masterFarmerStrategy, masterHintStrategy)
+                onMasterStrategyChange?.invoke(masterComputerStrategy, masterHintStrategy)
                 refresh()
             }
             action == "master_hint_master" -> {
                 masterHintStrategy = Difficulty.MASTER
-                onMasterStrategyChange?.invoke(masterFarmerStrategy, masterHintStrategy)
+                onMasterStrategyChange?.invoke(masterComputerStrategy, masterHintStrategy)
                 refresh()
             }
             action == "master_think_dec" -> {
@@ -1376,7 +1376,7 @@ class GameSurfaceView(context: Context) : SurfaceView(context), SurfaceHolder.Ca
 
         drawBackground(canvas)
         drawTopBar(canvas)
-        // 锄大D 无底牌：原 drawBottomCards（顶部中央三张底牌）已整体移除，
+        // 锄大D 发牌即开局，原底部三张底牌区域已整体移除，
         // 顶部中央位置改由电脑C 的信息面板占用
 
         // 横屏 4 人布局：电脑A 右侧、电脑B 左侧、电脑C 顶部中间（主界面不显示电脑信息框）
@@ -1639,7 +1639,7 @@ class GameSurfaceView(context: Context) : SurfaceView(context), SurfaceHolder.Ca
         scratchRect.set(panelX, topY, panelX + panelW, topY + panelH)
         canvas.drawRoundRect(scratchRect, 18f, 18f, cardBorderPaint)
 
-        // 锄大D 四人各自为战：无地主/农民身份，面板首行直接显示剩余张数
+        // 锄大D 四人各自为战：面板首行直接显示剩余张数
         // 剩余张数（放大2.5倍: 30*2.5=75 -> 用50f）
         textPaint.textSize = 46f * uiScale
         textPaint.color = Palette.gold
@@ -2014,7 +2014,7 @@ class GameSurfaceView(context: Context) : SurfaceView(context), SurfaceHolder.Ca
         canvas.restore()
     }
 
-    /** 绘制小尺寸牌（桌面展示/底牌）；alpha 用于入场淡入 */
+    /** 绘制小尺寸牌（桌面展示用）；alpha 用于入场淡入 */
     private fun drawMiniCard(canvas: Canvas, x: Float, y: Float, w: Float, h: Float,
                              card: Card, faceUp: Boolean, alpha: Float = 1f) {
         if (!faceUp) { drawCardBack(canvas, x, y, w, h); return }
@@ -2306,7 +2306,7 @@ class GameSurfaceView(context: Context) : SurfaceView(context), SurfaceHolder.Ca
                     addSettingsButton(canvas, target)
                 }
             }
-            // 锄大D 无叫分阶段：发牌结束即进入出牌阶段（GamePhase 已无 BIDDING），故此处只剩出牌按钮
+            // 锄大D 发牌结束即进入出牌阶段（GamePhase 无 BIDDING），故此处只剩出牌按钮
             // 出牌阶段
             phase == GamePhase.PLAYING && currentPlayer == 0 -> {
                 val canPass = !gameEngine.stateMachine.mustPlay()
@@ -2487,7 +2487,7 @@ class GameSurfaceView(context: Context) : SurfaceView(context), SurfaceHolder.Ca
         canvas.drawRoundRect(rect, 22f, 22f, buttonStrokePaint)
 
         // 文字颜色固定白色：buttonTextPaint 被设置窗口等复用且会被改成灰色，
-        // 若此处不显式复位，退出设置后游戏内按钮会继承灰色（叫分/提示/出牌变灰）。
+        // 若此处不显式复位，退出设置后游戏内按钮会继承灰色（提示/出牌变灰）。
         buttonTextPaint.color = Color.WHITE
         buttonTextPaint.textSize = 56f * uiScale
         drawTextWithShadow(canvas, text, x + w / 2, y + h / 2 + 18f, buttonTextPaint)
@@ -2552,7 +2552,7 @@ class GameSurfaceView(context: Context) : SurfaceView(context), SurfaceHolder.Ca
         val rate = if (stat.games > 0) (stat.wins * 100.0 / stat.games) else 0.0
         val totalRateLine = "总胜率:${stat.wins}/${stat.games} (${"%.0f".format(rate)}%)"
         val scoreLine = "总积分:${stat.score}"
-        // 锄大D 四人各自为战，无地主/农民分角色统计，难度按钮只保留「模式名 + 总胜率 + 总积分」三行
+        // 锄大D 四人各自为战，无分角色统计，难度按钮只保留「模式名 + 总胜率 + 总积分」三行
 
         // 内部文字行高布局随 uiScale 等比（否则按钮框放大后上下留白失衡、字相对框偏小）。
         // 行数：模式名 + 总胜率 + 总积分 = 3 行内容（框高不变，块整体垂直居中，留白更宽松）。
@@ -2725,7 +2725,7 @@ class GameSurfaceView(context: Context) : SurfaceView(context), SurfaceHolder.Ca
         buttonTextPaint.color = Color.parseColor("#E0E0E0")
         canvas.drawText("电脑ai策略", px + pw / 2f, py + 150f * ms, buttonTextPaint)
         drawStrategyToggle(canvas, target, bx, py + 170f * ms, bw, bh, optGap,
-            "普通", "大师", masterFarmerStrategy, "master_farmer_normal", "master_farmer_master")
+            "普通", "大师", masterComputerStrategy, "master_ai_normal", "master_ai_master")
 
         // 第二行：玩家提示ai
         buttonTextPaint.textSize = 34f * ms
@@ -2832,7 +2832,7 @@ class GameSurfaceView(context: Context) : SurfaceView(context), SurfaceHolder.Ca
     }
 
     /** 错误提示（红色弹窗，非法操作时弹出；到期自动清除）。
-     *  注意：清除时必须再触发一次重绘——非 PLAYING 阶段（叫分/结算）画面静止时绘制线程会停帧，
+     *  注意：清除时必须再触发一次重绘——非 PLAYING 阶段（发牌/结算）画面静止时绘制线程会停帧，
      *  若仅在此帧 return 而不 refresh，弹窗文字将残留在最后一帧画面上直到下一次刷新才消失。
      *  （PLAYING 阶段本就逐帧重绘，此处多发的一次 refresh 会被立即消费，无额外开销） */
     private fun drawError(canvas: Canvas) {

@@ -80,6 +80,16 @@ internal object MasterSearch {
     private val humanModelWeightTL = ThreadLocal<Double>()
     private val humanModelSeatTL = ThreadLocal<Int>()
 
+    /**
+     * 人类建模节点的决策缓存：单次 solve 内按局面键命中，避免同一人类节点被反复展开时
+     * 重复跑 [AIDecision] + 全量走法枚举（深层搜索里这类重复极多）。
+     * 用 ThreadLocal 隔离，仿真多线程各用各的表。
+     */
+    private val humanNodeCacheTL = ThreadLocal<HashMap<TransKey, HumanNode>>()
+
+    /** 人类建模节点缓存条目：[aiMove] 为代理选中走法，[fullMoves] 为该局面全部合法走法（软建模用） */
+    private class HumanNode(val aiMove: Move, val fullMoves: List<Move>)
+
     /** A-2-3-4-5：A 作 1 时的最小顺子（点数序列，14=A、15=2） */
     private val A2345 = listOf(3, 4, 5, 14, 15)
 
@@ -212,6 +222,7 @@ internal object MasterSearch {
         ctrlWeight: Int? = null,
         humanModelWeight: Double? = null,
         humanModelSeat: Int? = null,
+        initialPlayedMask: Long = 0L,
         cancelled: () -> Boolean = { false }
     ): CardGroup? {
         ctrlWeightTL.set(ctrlWeight ?: W_CTRL)
@@ -224,7 +235,9 @@ internal object MasterSearch {
             hands = Array(4) { i -> hands[i]?.toMutableList() ?: mutableListOf() },
             myIndex = myIndex,
             cur = current,
-            playedMask = 0L,
+            // 本局此前已出的牌：人类建模节点要靠它还原「真实人类看到的信息」。
+            // 若从 0 起算，搜索会把已被打出的牌也算作「未见」，人类模型会误判某点数仍有存货。
+            playedMask = initialPlayedMask,
             top = if (topGroup?.type == CardType.INVALID) null else topGroup,
             topPlayer = topPlayer,
             passes = passes
@@ -239,6 +252,8 @@ internal object MasterSearch {
         val counter = longArrayOf(0L)
         // 置换表：单次决策内有效，随 solve 返回后回收；迭代加深层间复用、跨决策不污染、天然线程安全
         val tt = HashMap<TransKey, TTEntry>()
+        // 人类建模节点缓存（仅在开启建模时建立）；本次决策结束前清掉，避免 ThreadLocal 长期持有
+        if ((humanModelWeightTL.get() ?: 0.0) > 0.0) humanNodeCacheTL.set(HashMap())
 
         var bestMove: Move? = rootMoves.first()
         // 根走法顺序只与牌面有关，排一次即可；后续层把上一层最优手提到首位（PV 优先）
@@ -279,6 +294,7 @@ internal object MasterSearch {
             }
         }
 
+        humanNodeCacheTL.remove()
         return when (val m = bestMove) {
             is Move.Play -> m.group
             is Move.Pass -> null
@@ -461,6 +477,29 @@ internal object MasterSearch {
     private fun generateHumanMoves(state: State, player: Int, weight: Double): List<Move> {
         val hand = state.hands[player]
         val topBig = state.hands[(player + 1) % 4].size == 1
+
+        // 缓存命中：同一局面（四家手牌 + 桌面 + 元信息）下人类走法完全相同，直接复用，
+        // 省掉重复的 AIDecision 推理与全量走法枚举——深层搜索里同一节点会被反复展开。
+        val cacheKey = stateKey(state)
+        val cache = humanNodeCacheTL.get()
+        val cached = cache?.get(cacheKey)
+        if (cached != null) {
+            return if (weight >= 1.0) listOf(cached.aiMove)
+            else beamPick(cached.aiMove, cached.fullMoves, weight)
+        }
+
+        // 顶大规则兜底：下家报单且桌面上是单张时，只要能压就必须出「最大单张」，不允许过牌。
+        // AIDecision 在「只有 2 或炸弹能压」时会建议过牌，那在规则上是非法的，
+        // 这里强制改写，保证被建模的人类不会走出规则禁止的过牌。
+        val forcedTopBig: Move? = if (topBig) {
+            val top = state.top
+            val maxCard = hand.maxWithOrNull(compareBy({ it.rank }, { it.suit.order }))
+            if (top != null && top.type == CardType.SINGLE && maxCard != null) {
+                val single = CardGroup(CardType.SINGLE, maxCard.rank, 1, listOf(maxCard), maxCard.suit.order)
+                if (CardRuleEngine.isValidPlay(single, top)) Move.Play(single) else null
+            } else null
+        } else null
+
         val isGameStart = state.top == null && state.hands.all { it.size == 13 }
 
         // 构造 AIDecision 上下文：其余 3 家手牌数（可见）+ 各点数未见张数（= 不在我手且尚未被出过的牌，
@@ -482,17 +521,23 @@ internal object MasterSearch {
             if (i == player) continue
             oppCounts[k++] = state.hands[i].size
         }
-        val decision = AIDecision.decide(
-            hand = hand,
-            lastPlay = state.top,
-            opponentCardCounts = oppCounts,
-            unseenCounts = unseen,
-            requireDiamond3 = isGameStart,
-            mustTopBig = topBig
-        )
-        val aiMove: Move = if (decision == null) Move.Pass else Move.Play(decision)
+        val decision = forcedTopBig ?: run {
+            val d = AIDecision.decide(
+                hand = hand,
+                lastPlay = state.top,
+                opponentCardCounts = oppCounts,
+                unseenCounts = unseen,
+                requireDiamond3 = isGameStart,
+                mustTopBig = topBig
+            )
+            if (d == null) Move.Pass else Move.Play(d)
+        }
+        val aiMove: Move = decision
 
-        if (weight >= 1.0) return listOf(aiMove)
+        if (weight >= 1.0) {
+            cache?.put(cacheKey, HumanNode(aiMove, emptyList()))
+            return listOf(aiMove)
+        }
 
         // 软建模：枚举全部合法走法（含顶大过滤），按「便宜优先」排序补充候选，数量随权重插值。
         // 权重→0 时 beam 趋近全量，退化为现行全展开行为（但此时分支已不进入，这里仅作安全阀）。
@@ -505,7 +550,19 @@ internal object MasterSearch {
                 mv is Move.Play && mv.group.type == CardType.SINGLE &&
                     maxCard != null && mv.group.cards.singleOrNull()?.id != maxCard.id
             }
+            // 能压必须出：顶大局面下过牌非法，从候选里去掉
+            if (forcedTopBig != null) fullMoves.removeIf { it === Move.Pass }
         }
+        cache?.put(cacheKey, HumanNode(aiMove, fullMoves))
+        return beamPick(aiMove, fullMoves, weight)
+    }
+
+    /**
+     * 软建模的候选裁剪：以 [aiMove] 为主选，按权重插值补充「便宜优先」候选。
+     * 权重 1 → 只剩主选；权重越低候选越多，趋近全量展开。
+     */
+    private fun beamPick(aiMove: Move, fullMoves: List<Move>, weight: Double): List<Move> {
+        if (fullMoves.isEmpty()) return listOf(aiMove)
         val beam = maxOf(1, kotlin.math.round(1 + (fullMoves.size - 1) * (1 - weight)).toInt())
         if (beam >= fullMoves.size) return fullMoves
         val rest = fullMoves.filter { it !== aiMove }.map { m ->

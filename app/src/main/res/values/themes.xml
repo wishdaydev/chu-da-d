@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- 应用主题：全屏无标题栏 -->
+    <style name="Theme.ChuDaD" parent="Theme.AppCompat.NoActionBar">
+        <item name="android:windowFullscreen">true</item>
+        <item name="android:windowNoTitle">true</item>
+        <!-- 冷启动窗口底色设为黑色，避免 SurfaceView 绘制前出现白闪 -->
+        <item name="android:windowBackground">@color/black</item>
+    </style>
+
+    <!-- 沉浸式主题基础版（API 24-26 生效；API 27+ 由 values-v27 覆盖并追加挖孔模式）。
+         ALWAYS 挖孔模式只能代码设置，见 MainActivity.applyImmersiveFullscreen() -->
+    <style name="Theme.ChuDaD.Immersive" parent="Theme.ChuDaD">
+        <!-- 绘制到安全区之外（状态栏、导航栏后面） -->
+        <item name="android:windowDrawsSystemBarBackgrounds">true</item>
+        <item name="android:statusBarColor">@android:color/transparent</item>
+        <item name="android:navigationBarColor">@android:color/transparent</item>
+    </style>
+</resources>

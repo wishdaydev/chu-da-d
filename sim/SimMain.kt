@@ -26,9 +26,16 @@ fun main(args: Array<String>) {
     val threads = (args.getOrNull(3)?.toIntOrNull() ?: 1).coerceAtLeast(1)
     val baseSeed = args.getOrNull(4)?.toLongOrNull() ?: 1L
 
+    // 调参支持：CTRL_W=治疗组权重（默认 15），CTRL_W_BASE=基线组权重（默认 null=与 CTRL_W 相同做对称仿真），
+    // TREAT_SEATS=使用 CTRL_W 的座位（逗号分隔，默认 "0"）。用于非对称对比：带控制权项的一方 vs 旧版(=0)。
+    val ctrlW = System.getenv("CTRL_W")?.toIntOrNull() ?: 15
+    val ctrlWBase = System.getenv("CTRL_W_BASE")?.toIntOrNull()
+    val treatSeats = (System.getenv("TREAT_SEATS") ?: "0").split(',').mapNotNull { it.trim().toIntOrNull() }.toSet()
+
     println(
         "锄大D 4人仿真: games=$games deadline=${deadlineMs}ms " +
-            "nodeLimit=$nodeLimit threads=$threads baseSeed=$baseSeed"
+            "nodeLimit=$nodeLimit threads=$threads baseSeed=$baseSeed " +
+            "CTRL_W=$ctrlW CTRL_W_BASE=$ctrlWBase TREAT_SEATS=$treatSeats"
     )
 
     val wins = IntArray(4)
@@ -38,7 +45,7 @@ fun main(args: Array<String>) {
 
     val runOne: (Int) -> Unit = { idx ->
         val seed = baseSeed + idx * 2654435761L
-        val (winner, moves, bad) = playGame(seed, deadlineMs, nodeLimit)
+        val (winner, moves, bad) = playGame(seed, deadlineMs, nodeLimit, ctrlW, ctrlWBase, treatSeats)
         synchronized(wins) { if (winner in 0..3) wins[winner]++ }
         totalMoves.addAndGet(moves.toLong())
         if (bad) illegal.incrementAndGet()
@@ -75,7 +82,10 @@ private fun deal(seed: Long): Array<MutableList<Card>> {
 private fun playGame(
     seed: Long,
     deadlineMs: Long,
-    nodeLimit: Int
+    nodeLimit: Int,
+    ctrlW: Int,
+    ctrlWBase: Int?,
+    treatSeats: Set<Int>
 ): Triple<Int, Int, Boolean> {
     val hands = deal(seed)
     var cur = 0
@@ -89,6 +99,8 @@ private fun playGame(
         val hand = hands[cur]
         if (hand.isEmpty()) return Triple(cur, moves, illegal)
 
+        // 非对称调参：治疗组座位用 CTRL_W，基线组用 CTRL_W_BASE（未设则全部同用 CTRL_W）
+        val w = if (ctrlWBase != null && cur !in treatSeats) ctrlWBase else ctrlW
         val decision = MasterSearch.solve(
             hands = hands.mapIndexed { i, h -> i to h.toList() }.toMap(),
             myIndex = cur,
@@ -97,7 +109,8 @@ private fun playGame(
             passes = passes,
             current = cur,
             deadlineMs = deadlineMs,
-            nodeLimit = nodeLimit
+            nodeLimit = nodeLimit,
+            ctrlWeight = w
         )
         val legal = CardRuleEngine.findAllValidPlays(hand, top)
         val passAllowed = top != null

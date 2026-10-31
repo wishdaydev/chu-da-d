@@ -27,6 +27,10 @@ import com.chudad.game.model.Suit
  *
  * 走法生成直接复用 [CardRuleEngine.findAllValidPlays]（含同花顺/四带一/葫芦/同花五等完整牌型，
  * 不裁剪候选集），保证搜索不会因候选集受限而漏掉最优解。
+ *
+ * 性能：辅以置换表（TT）——同一逻辑局面（四家手牌 + 桌面 top + 出牌权）会从大量不同出牌顺序中反复到达
+ * （尤其连续 3 次过牌后领出权回到 topPlayer），TT 令其只搜索一次，并缓存该局面下的最优走法用于走法排序，
+ * 在固定思考时间内显著放大有效搜索深度。
  */
 internal object MasterSearch {
 
@@ -58,11 +62,38 @@ internal object MasterSearch {
     private const val CTRL_STRAIGHT_FLUSH = 30  // 同花顺（顶级牌型）
     private const val CTRL_FOUR_WITH_ONE = 25   // 四带一（顶级牌型）
 
+    /**
+     * 当前搜索使用的控制权项权重（按线程隔离），可由 [solve] 的 [ctrlWeight] 参数临时覆盖，
+     * 以支持多线程仿真中不同座位使用不同权重做非对称对比（不影响默认行为与线上逻辑）。
+     */
+    private val ctrlWeightTL = ThreadLocal<Int>()
+
     /** A-2-3-4-5：A 作 1 时的最小顺子（点数序列，14=A、15=2） */
     private val A2345 = listOf(3, 4, 5, 14, 15)
 
     /** 单张牌的位掩码（id ∈ 0..51，适配 64 位） */
     private fun cardMask(card: Card): Long = 1L shl card.id
+
+    /** 单手牌的位掩码（按 card.id 置位，与顺序无关，直接作为局面键的可规范分量） */
+    private fun handMask(hand: List<Card>): Long {
+        var m = 0L
+        for (c in hand) m = m or cardMask(c)
+        return m
+    }
+
+    /** 当前局面的规范键：四家手牌掩码 + 桌面 top 掩码 + 元信息（cur/topPlayer/passes） */
+    private fun stateKey(state: State): TransKey {
+        val topMask = state.top?.cards?.fold(0L) { acc, c -> acc or cardMask(c) } ?: 0L
+        val curBits = (state.cur and 3).toLong()
+        val topBits = (((state.topPlayer + 1) and 7).toLong() shl 3)
+        val passBits = ((state.passes and 7).toLong() shl 6)
+        val meta = curBits or topBits or passBits
+        return TransKey(
+            handMask(state.hands[0]), handMask(state.hands[1]),
+            handMask(state.hands[2]), handMask(state.hands[3]),
+            topMask, meta
+        )
+    }
 
     /** 走法：出牌 或 过牌 */
     private sealed class Move {
@@ -112,6 +143,30 @@ internal object MasterSearch {
      */
     private const val MIN_PLAYS_CACHE_MAX = 20_000
 
+    // ===== 置换表（Transposition Table）=====
+    // 同一逻辑局面会从大量不同出牌顺序中反复到达（过牌 3 次后领出权回到 topPlayer，多条历史路径
+    // 漏斗式汇入相同「某人自由领出 + 固定手牌分布」子局面）。TT 令这些重复子树只搜索一次，并缓存
+    // 「该局面下的最优走法」用于走法排序，显著放大 alpha-beta 剪枝、在相同思考时间内算得更深。
+    // 作用域为单次 solve（每次决策新建、决策结束后随局部变量回收）：既避免跨决策污染，
+    // 又能在迭代加深的层间复用（浅层深结果喂给深层），同时天然线程安全（多线程仿真各用各的局部表）。
+
+    /** 置换表 bound 标志：条目值相对进入该节点时的原始窗口 [alphaIn, betaIn] 而言 */
+    private const val TT_EXACT = 0   // 精确值（命中即直接返回）
+    private const val TT_LOWER = 1   // 下界（真实值 ≥ value）：用于 fail-high 快速返回
+    private const val TT_UPPER = 2   // 上界（真实值 ≤ value）：用于 fail-low 快速返回
+
+    /** 单局决策内置换表容量兜底：满即整体清空（仅丢复用、不返回错误值），防止 60s 内内存无界增长 */
+    private const val TT_CACHE_MAX = 200_000
+
+    /** 置换表条目 */
+    private data class TTEntry(val value: Int, val flag: Int, val depth: Int, val bestMove: Move?)
+
+    /** 局面键（规范形式，与出牌顺序无关）：四家手牌掩码 + 桌面 top 掩码 + 元信息（cur/topPlayer/passes） */
+    private data class TransKey(
+        val h0: Long, val h1: Long, val h2: Long, val h3: Long,
+        val top: Long, val meta: Long
+    )
+
     /**
      * 求解当前局面下 myIndex 的最优一手。
      *
@@ -133,8 +188,10 @@ internal object MasterSearch {
         nodeLimit: Int,
         mustContainDiamond3: Boolean = false,
         mustTopBig: Boolean = false,
+        ctrlWeight: Int? = null,
         cancelled: () -> Boolean = { false }
     ): CardGroup? {
+        ctrlWeightTL.set(ctrlWeight ?: W_CTRL)
         val myHand = hands[myIndex] ?: return null
         if (myHand.isEmpty()) return null
 
@@ -153,6 +210,8 @@ internal object MasterSearch {
 
         val deadline = System.currentTimeMillis() + deadlineMs
         val counter = longArrayOf(0L)
+        // 置换表：单次决策内有效，随 solve 返回后回收；迭代加深层间复用、跨决策不污染、天然线程安全
+        val tt = HashMap<TransKey, TTEntry>()
 
         var bestMove: Move? = rootMoves.first()
         // 根走法顺序只与牌面有关，排一次即可；后续层把上一层最优手提到首位（PV 优先）
@@ -170,7 +229,7 @@ internal object MasterSearch {
                 val v = when {
                     undo.winner == myIndex -> WIN
                     undo.winner >= 0 -> -WIN
-                    else -> search(state, myIndex, alpha, INF, depth - 1, 1, deadline, counter, nodeLimit, cancelled)
+                    else -> search(state, myIndex, alpha, INF, depth - 1, 1, deadline, counter, nodeLimit, cancelled, tt)
                 }
                 undoMove(state, undo)
 
@@ -253,7 +312,8 @@ internal object MasterSearch {
         deadline: Long,
         counter: LongArray,
         nodeLimit: Int,
-        cancelled: () -> Boolean
+        cancelled: () -> Boolean,
+        tt: MutableMap<TransKey, TTEntry>
     ): Int {
         counter[0]++
         if (System.currentTimeMillis() > deadline || counter[0] > nodeLimit || cancelled()) {
@@ -261,35 +321,62 @@ internal object MasterSearch {
         }
         if (depth <= 0) return evaluate(state, myIndex)
 
+        // —— 置换表查询：相同逻辑局面只搜索一次 ——
+        val key = stateKey(state)
+        val entry = tt[key]
+        // 浅层命中（depth 不足）不取缓存值，但仍提供走法排序提示
+        var ttPreferred: Move? = entry?.bestMove
+        var alpha = alphaIn
+        var beta = betaIn
+        if (entry != null && entry.depth >= depth) {
+            when (entry.flag) {
+                TT_EXACT -> return entry.value                          // 精确命中，直接返回
+                TT_LOWER -> if (entry.value >= beta) return entry.value // 下界 ≥ β → 可 fail-high
+                TT_UPPER -> if (entry.value <= alpha) return entry.value // 上界 ≤ α → 可 fail-low
+            }
+        }
+
         val cur = state.cur
         val moves = generateMoves(state, cur, forbidTopBigPass = cur == myIndex)
         if (moves.isEmpty()) return evaluate(state, myIndex)
 
         val isMax = (cur == myIndex)
-        val ordered = orderMoves(state, cur, moves, isMax)
-        var alpha = alphaIn
-        var beta = betaIn
+        val ordered = orderMoves(state, cur, moves, isMax, ttPreferred)
         var best = if (isMax) -INF else INF
+        var bestMoveAtNode: Move? = null
 
+        var aborted = false
         for (mv in ordered) {
-            if (System.currentTimeMillis() > deadline || counter[0] > nodeLimit) break
+            if (System.currentTimeMillis() > deadline || counter[0] > nodeLimit) { aborted = true; break }
             val undo = applyMove(state, cur, mv)
             val v = when {
                 undo.winner == myIndex -> WIN - ply
                 undo.winner >= 0 -> -(WIN - ply)
-                else -> search(state, myIndex, alpha, beta, depth - 1, ply + 1, deadline, counter, nodeLimit, cancelled)
+                else -> search(state, myIndex, alpha, beta, depth - 1, ply + 1, deadline, counter, nodeLimit, cancelled, tt)
             }
             undoMove(state, undo)
 
             if (isMax) {
-                if (v > best) best = v
+                if (v > best) { best = v; bestMoveAtNode = mv }
                 if (best > alpha) alpha = best
                 if (alpha >= beta) break
             } else {
-                if (v < best) best = v
+                if (v < best) { best = v; bestMoveAtNode = mv }
                 if (best < beta) beta = best
                 if (alpha >= beta) break
             }
+        }
+
+        // 仅在完整跑完本节点时落库（避免把「被时间预算打断的部分搜索」误存为精确值）。
+        // bound 类型以进入节点时的原始窗口 [alphaIn, betaIn] 判定，保证后续命中正确。
+        if (!aborted) {
+            val flag = when {
+                best <= alphaIn -> TT_UPPER
+                best >= betaIn -> TT_LOWER
+                else -> TT_EXACT
+            }
+            tt[key] = TTEntry(best, flag, depth, bestMoveAtNode)
+            if (tt.size >= TT_CACHE_MAX) tt.clear()
         }
         return best
     }
@@ -380,7 +467,7 @@ internal object MasterSearch {
      * - MIN：能一手出完者优先（对手出完即我负，需尽快探明）；否则按主牌点数降序（大牌压我）。
      * 过牌在两类中均排最后。
      */
-    private fun orderMoves(state: State, player: Int, moves: List<Move>, isMax: Boolean): List<Move> {
+    private fun orderMoves(state: State, player: Int, moves: List<Move>, isMax: Boolean, preferred: Move? = null): List<Move> {
         val handSize = state.hands[player].size
         val scored = moves.map { mv ->
             val priority = when (mv) {
@@ -393,7 +480,11 @@ internal object MasterSearch {
             }
             mv to priority
         }
-        return scored.sortedBy { it.second }.map { it.first }
+        val ordered = scored.sortedBy { it.second }.map { it.first }
+        // 置换表命中的最优走法提到首位：更早拿到好上界，放大 alpha-beta 剪枝
+        return if (preferred != null && ordered.contains(preferred)) {
+            listOf(preferred) + ordered.filter { it !== preferred }
+        } else ordered
     }
 
     /** 从我视角评估局面：正=我领先，负=我落后 */
@@ -415,6 +506,7 @@ internal object MasterSearch {
         val curCanSeize = state.top != null &&
             CardRuleEngine.findAllValidPlays(state.hands[state.cur], state.top).isNotEmpty()
 
+        val wCtrl = ctrlWeightTL.get() ?: W_CTRL
         val myCtrl = handStrength(state.hands[myIndex]) + currentPlayerBonus(state, myIndex, curCanSeize)
         var oppCtrl = 0
         for (i in 0..3) {
@@ -425,7 +517,7 @@ internal object MasterSearch {
 
         val v = (oppPlays - myPlays) * W_PLAYS
             + (oppCards - myCards) * W_CARDS
-            + (myCtrl - oppCtrl) * W_CTRL
+            + (myCtrl - oppCtrl) * wCtrl
         return v.coerceIn(-WIN / 2, WIN / 2)
     }
 

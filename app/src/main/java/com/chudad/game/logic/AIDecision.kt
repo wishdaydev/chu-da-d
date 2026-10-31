@@ -3,7 +3,6 @@ package com.chudad.game.logic
 import com.chudad.game.model.Card
 import com.chudad.game.model.CardGroup
 import com.chudad.game.model.CardType
-import com.chudad.game.model.Difficulty
 
 /**
  * 普通模式 AI（启发式规则）—— 锄大D 版
@@ -35,8 +34,6 @@ object AIDecision {
      * 决策入口
      * @param hand 我方手牌
      * @param lastPlay 上一手牌（null 表示自由出牌）
-     * @param difficulty 难度（普通模式恒走本启发式）
-     * @param myIndex 我方索引
      * @param opponentCardCounts 其余 3 家的手牌数
      * @param unseenCounts 我方未见各点数剩余张数（下标即 rank）
      * @return 决定出的牌组；null 表示过牌
@@ -44,8 +41,6 @@ object AIDecision {
     fun decide(
         hand: List<Card>,
         lastPlay: CardGroup?,
-        difficulty: Difficulty,
-        myIndex: Int,
         opponentCardCounts: IntArray,
         unseenCounts: IntArray
     ): CardGroup? {

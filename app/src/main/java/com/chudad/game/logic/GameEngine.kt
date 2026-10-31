@@ -234,8 +234,6 @@ class GameEngine {
                 val decision = AIDecision.decide(
                     hand = players[playerIndex].handCards,
                     lastPlay = stateMachine.lastPlayedGroup,
-                    difficulty = Difficulty.NORMAL,
-                    myIndex = playerIndex,
                     opponentCardCounts = getOpponentCardCounts(playerIndex),
                     unseenCounts = getUnseenRankCounts(playerIndex)
                 )

@@ -2,7 +2,6 @@ package com.chudad.game.logic
 
 import com.chudad.game.model.Card
 import com.chudad.game.model.CardGroup
-import com.chudad.game.model.Difficulty
 
 /**
  * 大师模式 AI 决策（锄大D）
@@ -84,8 +83,6 @@ object MasterAIDecision {
         return AIDecision.decide(
             hand = hand,
             lastPlay = snapshot.lastPlay,
-            difficulty = Difficulty.MASTER,
-            myIndex = snapshot.myIndex,
             opponentCardCounts = opponentCardCounts,
             unseenCounts = unseenCounts
         )

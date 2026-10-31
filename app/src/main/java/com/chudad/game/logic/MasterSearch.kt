@@ -99,7 +99,6 @@ internal object MasterSearch {
         val counter = longArrayOf(0L)
 
         var bestMove: Move? = rootMoves.first()
-        var completedDepth = 0
 
         for (depth in 1..MAX_DEPTH) {
             val rootOrdered = orderMoves(state, myIndex, rootMoves, isMax = true)
@@ -123,7 +122,6 @@ internal object MasterSearch {
 
             // 仅采纳完整跑完当前深度的结果
             if (System.currentTimeMillis() <= deadline && counter[0] <= nodeLimit) {
-                completedDepth = depth
                 if (localBest != null) bestMove = localBest
                 // 已找到必胜首手，提前结束
                 if (bestVal >= WIN - 1) break

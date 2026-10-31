@@ -49,6 +49,7 @@ SRC_COMMON=(
     app/src/main/java/com/chudad/game/logic/AIDecision.kt
     app/src/main/java/com/chudad/game/logic/MasterSearch.kt
     app/src/main/java/com/chudad/game/logic/PerfBench.kt
+    sim/AIDecisionV0.kt
     sim/SimMain.kt
     sim/PerfMain.kt
 )

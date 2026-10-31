@@ -637,10 +637,14 @@ class GameEngine {
     // ============================ 信息推导（仅凭公开信息） ============================
 
     /** 其余 3 家的手牌数 */
+    /**
+     * 其余 3 家的剩余张数，**下标 0 固定为下家**（出牌顺序 0→1→2→3 顺时针），其余按顺序排。
+     *
+     * 顺序必须与出牌顺序一致：AIDecision 用 `[0]` 判断「下家报单」，若按座位号升序排，
+     * myIndex=1/2 时会错位成别的玩家，下家保护就落到了错误的人身上。
+     */
     private fun getOpponentCardCounts(myIndex: Int): IntArray =
-        players.filter { it.index != myIndex }
-            .map { legalCardCount(it.index) }
-            .toIntArray()
+        (1..3).map { legalCardCount((myIndex + it) % 4) }.toIntArray()
 
     /** 某玩家剩余手牌数 = 13 - 其已打出张数（公共记录推导） */
     private fun legalCardCount(playerIndex: Int): Int {

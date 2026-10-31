@@ -1,6 +1,7 @@
 package com.chudad.sim
 
 import com.chudad.game.logic.AIDecision
+import com.chudad.game.logic.AIDecisionV0
 import com.chudad.game.logic.CardRuleEngine
 import com.chudad.game.logic.MasterSearch
 import com.chudad.game.model.Card
@@ -76,12 +77,30 @@ fun main(args: Array<String>) {
         ?.mapNotNull { it.trim().toIntOrNull() }?.filter { it in 0..3 }?.toSet()
         ?: if (oppModel == 1) setOf(0, 1, 2, 3) else emptySet()
 
+    // A/B 对照：这些座位改用旧版启发式（sim/AIDecisionV0.kt 快照），用于量化普通模式改动的强度差。
+    // 四家全启发式、新版坐 0/2、旧版坐 1/3 时，胜率偏离 50% 即为新版强度增益。
+    val legacySeats: Set<Int> = System.getenv("LEGACY_SEATS")?.split(',')
+        ?.mapNotNull { it.trim().toIntOrNull() }?.filter { it in 0..3 }?.toSet()
+        ?: emptySet()
+
+    // 按座位覆盖节点预算：用于「弱搜索 vs 强搜索」「同源不同算力」的强度对照，
+    // 例如 NODE_LIMIT_SEATS="0:10000" 让 0 号位每步只用 1 万节点，其余座位按位置参数给的预算。
+    val seatNodeLimit: Map<Int, Int> = System.getenv("NODE_LIMIT_SEATS")
+        ?.split(',')
+        ?.mapNotNull { part ->
+            val kv = part.split(':')
+            if (kv.size != 2) return@mapNotNull null
+            val seat = kv[0].trim().toIntOrNull() ?: return@mapNotNull null
+            val n = kv[1].trim().toIntOrNull() ?: return@mapNotNull null
+            if (seat in 0..3 && n > 0) seat to n else null
+        }?.toMap() ?: emptyMap()
+
     println(
         "锄大D 4人仿真: games=$games deadline=${deadlineMs}ms " +
             "nodeLimit=$nodeLimit threads=$threads baseSeed=$baseSeed " +
             "HUMAN_MODEL_SEAT=$humanSeat HUMAN_MODEL_WEIGHT=$humanWeight " +
             "HEURISTIC_SEATS=$heuristicSeats SELFISH_SEATS=$selfishSeats K=$oppTopK " +
-            "MAX_DEPTH=${maxDepth ?: "自动"}"
+            "MAX_DEPTH=${maxDepth ?: "自动"} LEGACY_SEATS=$legacySeats SEAT_NODES=$seatNodeLimit"
     )
 
     val wins = IntArray(4)
@@ -102,7 +121,7 @@ fun main(args: Array<String>) {
         try {
             val r = playGame(
                 seed, deadlineMs, nodeLimit, humanSeat, humanWeight,
-                heuristicSeats, oppTopK, selfishSeats, maxDepth
+                heuristicSeats, oppTopK, selfishSeats, maxDepth, legacySeats, seatNodeLimit
             )
             synchronized(wins) { if (r.winner in 0..3) wins[r.winner]++ }
             totalMoves.addAndGet(r.moves.toLong())
@@ -204,7 +223,9 @@ private fun playGame(
     heuristicSeats: Set<Int>,
     oppTopK: Int,
     selfishSeats: Set<Int>,
-    maxDepth: Int?
+    maxDepth: Int?,
+    legacySeats: Set<Int> = emptySet(),
+    seatNodeLimit: Map<Int, Int> = emptyMap()
 ): GameResult {
     val hands = deal(seed)
     // 真实开局：持 ♦3 者先出，且首手必须含 ♦3。
@@ -235,7 +256,7 @@ private fun playGame(
         // 人类建模实验：指定的「人类座位」用 AIDecision 代理；其余座位开启 modelHuman。
         val useProxy = cur in heuristicSeats
         val raw = if (useProxy) {
-            aiDecideForSim(hands, cur, top, playedSet(playedMask))
+            aiDecideForSim(hands, cur, top, playedSet(playedMask), cur in legacySeats)
         } else {
             MasterSearch.solve(
                 hands = hands.mapIndexed { i, h -> i to h.toList() }.toMap(),
@@ -245,7 +266,7 @@ private fun playGame(
                 passes = passes,
                 current = cur,
                 deadlineMs = deadlineMs,
-                nodeLimit = nodeLimit,
+                nodeLimit = seatNodeLimit[cur] ?: nodeLimit,
                 mustContainDiamond3 = mustD3,
                 humanModelWeight = humanWeight,
                 humanModelSeat = humanSeat,
@@ -318,7 +339,8 @@ private fun aiDecideForSim(
     hands: Array<MutableList<Card>>,
     cur: Int,
     top: CardGroup?,
-    playedIds: Set<Int>
+    playedIds: Set<Int>,
+    legacy: Boolean = false
 ): CardGroup? {
     val hand = hands[cur]
     val oppCounts = IntArray(3)
@@ -330,20 +352,33 @@ private fun aiDecideForSim(
     val unseen = IntArray(16)
     for (r in 3..15) unseen[r] = 4 - own[r] - playedCnt[r]
     var k = 0
-    for (i in 0..3) {
-        if (i == cur) continue
-        oppCounts[k++] = hands[i].size
+    // 与出牌顺序一致：[0] 恒为下家。按座位号升序排会让 AIDecision 的「下家报单」判断错位
+    for (i in 1..3) {
+        oppCounts[k++] = hands[(cur + i) % 4].size
     }
     val topBig = hands[(cur + 1) % 4].size == 1
     val isGameStart = top == null && hands.all { it.size == 13 }
-    val d = AIDecision.decide(
-        hand = hand,
-        lastPlay = top,
-        opponentCardCounts = oppCounts,
-        unseenCounts = unseen,
-        requireDiamond3 = isGameStart,
-        mustTopBig = topBig
-    )
+    // legacy=true 走旧版快照（A/B 用），注意旧版假设 oppCounts[0] 是下家，
+    // 这里传的本来就是「下家优先」顺序，故两边口径一致。
+    val d = if (legacy) {
+        AIDecisionV0.decide(
+            hand = hand,
+            lastPlay = top,
+            opponentCardCounts = oppCounts,
+            unseenCounts = unseen,
+            requireDiamond3 = isGameStart,
+            mustTopBig = topBig
+        )
+    } else {
+        AIDecision.decide(
+            hand = hand,
+            lastPlay = top,
+            opponentCardCounts = oppCounts,
+            unseenCounts = unseen,
+            requireDiamond3 = isGameStart,
+            mustTopBig = topBig
+        )
+    }
     // 顶大规则兜底：下家报单且桌上是单张时，能压就必须出最大单张（真实引擎由 humanPass 拦截）。
     // 代理若在这里「过牌」，等于让人类享受规则外的宽松，建模实验结论会失真。
     if (topBig && top != null && top.type == CardType.SINGLE) {

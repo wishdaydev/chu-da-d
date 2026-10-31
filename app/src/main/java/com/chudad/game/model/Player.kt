@@ -11,17 +11,16 @@ enum class Difficulty {
 /**
  * 玩家数据类
  * 锄大D 为 4 人各自为战：无角色区分、发牌即开局、无底牌。
+ * 难度由引擎统一持有（[com.chudad.game.logic.GameEngine.aiDifficulty]），玩家本身不存难度。
  *
  * @param index 玩家索引（0=底部人类玩家, 1/2/3=AI 玩家）
  * @param name 显示名称
  * @param isHuman 是否为人类玩家
- * @param difficulty AI 难度（仅 AI 玩家有效）
  */
 data class Player(
     val index: Int,
     val name: String,
-    val isHuman: Boolean,
-    var difficulty: Difficulty = Difficulty.NORMAL
+    val isHuman: Boolean
 ) {
     /** 手牌列表（CopyOnWrite：绘制线程与 UI 线程并发读写安全） */
     val handCards: MutableList<Card> = java.util.concurrent.CopyOnWriteArrayList()

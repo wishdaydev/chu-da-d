@@ -11,7 +11,7 @@ import com.chudad.game.model.CardGroup
  *
  * 决策核心为 [MasterSearch] 的 4 人完美信息搜索：位压缩覆盖 4 家手牌，
  * 走法生成覆盖锄大D 全部牌型（含顺子/同花五/葫芦/四带一/同花顺），评估为「手数竞速 + 牌质」，
- * 采用 alpha-beta + 置换表 + 迭代加深。搜索无可行解或超时回退到普通模式
+ * 采用 alpha-beta + 迭代加深（根节点 PV 优先）。搜索无可行解或超时回退到普通模式
  * 启发式 [AIDecision]，保证大师模式始终可完整对局。
  */
 object MasterAIDecision {

@@ -314,10 +314,14 @@ object CardRuleEngine {
                 if (j - i + 1 >= STRAIGHT_LEN) {
                     for (start in i..(j - STRAIGHT_LEN + 1)) {
                         val seq = (start until start + STRAIGHT_LEN).map { ranks[it] }
-                        val cards = seq.map { r -> pool[r]!!.last() }
-                        // 非同花分支选出的牌若恰好同花，实际是同花顺（由 flush 分支生成），
-                        // 不能标成顺子，否则会被低层级牌误压。
-                        if (!flush && cards.all { it.suit == cards[0].suit }) continue
+                        val cards = if (flush) {
+                            seq.map { r -> pool[r]!!.last() }
+                        } else {
+                            // 非同花分支若恰好凑成同花，实为同花顺（由 flush 分支生成），
+                            // 不能标成顺子；但也不能整手丢弃——换一张其它花色即可得到
+                            // 同样点数段的普通顺子，否则会「只能出同花顺」，白白浪费强牌。
+                            pickNonFlush(pool, seq) ?: continue
+                        }
                         results.add(group(type, seq.last(), cards))
                     }
                 }
@@ -329,13 +333,33 @@ object CardRuleEngine {
                 pool.containsKey(RANK_A) && pool.containsKey(RANK_TWO)
             ) {
                 val seq = listOf(3, 4, 5, RANK_A, RANK_TWO)
-                val cards = seq.map { r -> pool[r]!!.last() }
-                if (flush || cards.any { it.suit != cards[0].suit }) {
-                    results.add(group(type, 5, cards))
+                val cards = if (flush) {
+                    seq.map { r -> pool[r]!!.last() }
+                } else {
+                    pickNonFlush(pool, seq) ?: continue
                 }
+                results.add(group(type, 5, cards))
             }
         }
         return results
+    }
+
+    /**
+     * 从各点数的候选牌中凑一手「非同花」组合（用于生成普通顺子）。
+     * 先取每个点数的最大花色；若恰好全同花，则把其中一张换成其它花色。
+     * @return 非同花组合；该点数段在手中无法凑出非同花时返回 null
+     */
+    private fun pickNonFlush(pool: Map<Int, List<Card>>, ranks: List<Int>): List<Card>? {
+        val picked = ranks.map { r -> pool[r]!!.last() }.toMutableList()
+        if (picked.any { it.suit != picked[0].suit }) return picked
+        for (idx in picked.indices) {
+            val other = pool[picked[idx].rank]!!.firstOrNull { it.suit != picked[idx].suit }
+            if (other != null) {
+                picked[idx] = other
+                return picked
+            }
+        }
+        return null
     }
 
     /**

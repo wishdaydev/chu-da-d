@@ -42,9 +42,9 @@ class GameEngine {
     /** 四位玩家：0=底部人类，1/2/3=AI */
     val players = listOf(
         Player(0, "你", isHuman = true),
-        Player(1, "电脑A", isHuman = false, difficulty = Difficulty.NORMAL),
-        Player(2, "电脑B", isHuman = false, difficulty = Difficulty.NORMAL),
-        Player(3, "电脑C", isHuman = false, difficulty = Difficulty.NORMAL)
+        Player(1, "电脑A", isHuman = false),
+        Player(2, "电脑B", isHuman = false),
+        Player(3, "电脑C", isHuman = false)
     )
 
     /** 游戏状态机 */
@@ -54,13 +54,9 @@ class GameEngine {
     var aiDifficulty: Difficulty = Difficulty.NORMAL
 
     /**
-     * 大师模式下「电脑玩家是否使用全信息搜索」策略。
-     * 锄大D 为四人各自为战：大师模式中三个电脑玩家出牌是否走
-     * 完美信息搜索（开启=全开挂，关闭=走普通启发式）。
+     * 大师模式「玩家提示 AI 策略」：人类点「提示」时是否使用大师全信息策略。
+     * 电脑玩家在大师模式下固定走全信息搜索，不再提供开关。
      */
-    var aiMasterStrategy: Difficulty = Difficulty.NORMAL
-
-    /** 大师模式「玩家提示 AI 策略」：人类点「提示」时是否使用大师全信息策略 */
     var playerHintStrategy: Difficulty = Difficulty.NORMAL
 
     /** 回调接口 */
@@ -107,10 +103,7 @@ class GameEngine {
     /** 开始新游戏：洗牌发牌（4 人各 13 张） */
     fun startNewGame() {
         searchEpoch++                       // 使在途的后台搜索结果作废
-        players.forEach {
-            it.handCards.clear()
-            if (!it.isHuman) it.difficulty = aiDifficulty
-        }
+        players.forEach { it.handCards.clear() }
         playedByPlayer.forEach { it.fill(0) }
         selectedCardIndices.clear()
 
@@ -271,13 +264,10 @@ class GameEngine {
     // ============================ AI 调度 ============================
 
     /**
-     * 该 AI 是否走大师全信息搜索：仅大师模式生效，且受 [aiMasterStrategy] 设置控制
+     * 该 AI 是否走大师全信息搜索：大师模式下三个电脑玩家固定使用（无开关）。
      */
-    private fun shouldUseMasterPlay(playerIndex: Int): Boolean {
-        if (aiDifficulty != Difficulty.MASTER) return false
-        if (players[playerIndex].isHuman) return false
-        return aiMasterStrategy == Difficulty.MASTER
-    }
+    private fun shouldUseMasterPlay(playerIndex: Int): Boolean =
+        aiDifficulty == Difficulty.MASTER && !players[playerIndex].isHuman
 
     private fun scheduleAIPlay(playerIndex: Int) {
         val turnStartMs = System.currentTimeMillis()

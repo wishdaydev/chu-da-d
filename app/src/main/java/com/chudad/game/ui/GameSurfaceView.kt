@@ -488,13 +488,12 @@ class GameSurfaceView(context: Context) : SurfaceView(context), SurfaceHolder.Ca
     /** 重置某模式统计的回调（由 MainActivity 注入，负责清零并持久化保存） */
     var onResetStats: ((Difficulty) -> Unit)? = null
 
-    /** 大师模式 AI 策略（本地显示状态，由 MainActivity 启动时初始化） */
-    private var masterComputerStrategy: Difficulty = Difficulty.NORMAL
+    /** 大师模式「玩家提示ai」策略（本地显示状态，由 MainActivity 启动时初始化） */
     private var masterHintStrategy: Difficulty = Difficulty.NORMAL
     /** 大师模式 AI 最大思考时间（秒），本地显示状态，2~60，默认 5；仅在关闭设置时落盘 */
     private var masterThinkSeconds: Int = 5
-    /** 大师模式 AI 策略变更回调（由 MainActivity 注入，负责持久化保存） */
-    var onMasterStrategyChange: ((Difficulty, Difficulty) -> Unit)? = null
+    /** 大师模式「玩家提示ai」策略变更回调（由 MainActivity 注入，负责持久化保存） */
+    var onHintStrategyChange: ((Difficulty) -> Unit)? = null
     /** 大师模式 AI 思考时间变更回调（关闭设置时由 MainActivity 注入，负责落盘并写入引擎） */
     var onMasterThinkTimeChange: ((Int) -> Unit)? = null
     /** 备份与还原：导出/导入回调（由 MainActivity 注入，负责启动 SAF 系统选择器） */
@@ -925,9 +924,8 @@ class GameSurfaceView(context: Context) : SurfaceView(context), SurfaceHolder.Ca
         displayMode = diff
     }
 
-    /** 初始化大师模式 AI 策略的显示状态（由 MainActivity 启动时调用） */
-    fun setMasterStrategy(computerAi: Difficulty, playerHint: Difficulty) {
-        masterComputerStrategy = computerAi
+    /** 初始化大师模式「玩家提示ai」策略的显示状态（由 MainActivity 启动时调用） */
+    fun setHintStrategy(playerHint: Difficulty) {
         masterHintStrategy = playerHint
     }
 
@@ -1312,8 +1310,8 @@ class GameSurfaceView(context: Context) : SurfaceView(context), SurfaceHolder.Ca
                 refresh()
             }
             action == "close_settings" -> {
-                // 关闭前持久化保存设置项（大师策略实时落盘；思考时间与之一并落盘）
-                onMasterStrategyChange?.invoke(masterComputerStrategy, masterHintStrategy)
+                // 关闭前持久化保存设置项（提示策略实时落盘；思考时间与之一并落盘）
+                onHintStrategyChange?.invoke(masterHintStrategy)
                 onMasterThinkTimeChange?.invoke(masterThinkSeconds)
                 settingsOpen = false
                 confirmResetMode = null
@@ -1351,24 +1349,14 @@ class GameSurfaceView(context: Context) : SurfaceView(context), SurfaceHolder.Ca
                 importConfirmPending = false
                 refresh()
             }
-            action == "master_ai_normal" -> {
-                masterComputerStrategy = Difficulty.NORMAL
-                onMasterStrategyChange?.invoke(masterComputerStrategy, masterHintStrategy)
-                refresh()
-            }
-            action == "master_ai_master" -> {
-                masterComputerStrategy = Difficulty.MASTER
-                onMasterStrategyChange?.invoke(masterComputerStrategy, masterHintStrategy)
-                refresh()
-            }
             action == "master_hint_normal" -> {
                 masterHintStrategy = Difficulty.NORMAL
-                onMasterStrategyChange?.invoke(masterComputerStrategy, masterHintStrategy)
+                onHintStrategyChange?.invoke(masterHintStrategy)
                 refresh()
             }
             action == "master_hint_master" -> {
                 masterHintStrategy = Difficulty.MASTER
-                onMasterStrategyChange?.invoke(masterComputerStrategy, masterHintStrategy)
+                onHintStrategyChange?.invoke(masterHintStrategy)
                 refresh()
             }
             action == "master_think_dec" -> {
@@ -2736,7 +2724,7 @@ class GameSurfaceView(context: Context) : SurfaceView(context), SurfaceHolder.Ca
             Palette.btnBlue, Palette.btnBlueDark, "import_backup")
     }
 
-    /** 左面板：大师模式设置（两个策略开关，普通/大师二选一；去掉“策略”二字，底部仅保留一行说明） */
+    /** 左面板：大师模式设置（「玩家提示ai」开关 + 最大思考时间步进器，底部两行说明） */
     private fun drawMasterStrategyPanel(canvas: Canvas, target: MutableList<ButtonRect>, showButtons: Boolean,
                                          px: Float, py: Float, pw: Float, ph: Float, ms: Float) {
         val panel = RectF(px, py, px + pw, py + ph)
@@ -2754,30 +2742,23 @@ class GameSurfaceView(context: Context) : SurfaceView(context), SurfaceHolder.Ca
         val bx = px + 40f * ms
         val optGap = 24f * ms
 
-        // 第一行：电脑ai策略（锄大D 四人各自为战，大师模式下此开关决定电脑玩家是否走全信息搜索）
+        // 第一行：玩家提示ai（电脑玩家在大师模式下固定走全信息搜索，不再提供开关）
         buttonTextPaint.textSize = 34f * ms
         buttonTextPaint.color = Color.parseColor("#E0E0E0")
-        canvas.drawText("电脑ai策略", px + pw / 2f, py + 150f * ms, buttonTextPaint)
-        drawStrategyToggle(canvas, target, bx, py + 170f * ms, bw, bh, optGap,
-            "普通", "大师", masterComputerStrategy, "master_ai_normal", "master_ai_master")
-
-        // 第二行：玩家提示ai
-        buttonTextPaint.textSize = 34f * ms
-        buttonTextPaint.color = Color.parseColor("#E0E0E0")
-        canvas.drawText("玩家提示ai", px + pw / 2f, py + 320f * ms, buttonTextPaint)
-        drawStrategyToggle(canvas, target, bx, py + 340f * ms, bw, bh, optGap,
+        canvas.drawText("玩家提示ai", px + pw / 2f, py + 200f * ms, buttonTextPaint)
+        drawStrategyToggle(canvas, target, bx, py + 220f * ms, bw, bh, optGap,
             "普通", "大师", masterHintStrategy, "master_hint_normal", "master_hint_master")
 
-        // 第三行：ai最大思考时间(秒)，步进器 − [数值] +（2~60，默认5，关闭设置时落盘）
+        // 第二行：ai最大思考时间(秒)，步进器 − [数值] +（2~60，默认5，关闭设置时落盘）
         // 数值显示在中间单元格，确保“X 秒”位于 − 与 + 之间
         buttonTextPaint.textSize = 34f * ms
         buttonTextPaint.color = Color.parseColor("#E0E0E0")
-        canvas.drawText("ai最大思考时间(秒)", px + pw / 2f, py + 500f * ms, buttonTextPaint)
+        canvas.drawText("ai最大思考时间(秒)", px + pw / 2f, py + 400f * ms, buttonTextPaint)
 
         val stepGap = 120f * ms                    // 中间数值单元格宽度，容纳“X 秒”文本
         val sbw = (pw - 80f * ms - stepGap) / 2f   // 两端 −/+ 按钮宽度（与面板内边距一致）
         val sbx = px + 40f * ms
-        val sby = py + 520f * ms
+        val sby = py + 420f * ms
         addButton(canvas, target, "−", sbx, sby, sbw, 80f * ms,
             Palette.btnStep, Palette.bubbleFill, "master_think_dec")
         addButton(canvas, target, "+", sbx + sbw + stepGap, sby, sbw, 80f * ms,
@@ -2786,11 +2767,11 @@ class GameSurfaceView(context: Context) : SurfaceView(context), SurfaceHolder.Ca
         buttonTextPaint.color = Color.WHITE
         canvas.drawText("${masterThinkSeconds} 秒", px + pw / 2f, sby + 80f * ms / 2f + 18f * ms, buttonTextPaint)
 
-        // 底部说明：两行，明确「思考时间只在电脑ai=大师时生效」，避免误以为设置无效
+        // 底部说明：两行，说明电脑固定走大师搜索、思考时间对强度与节奏的影响
         buttonTextPaint.textSize = 28f * ms
         buttonTextPaint.color = Color.parseColor("#9E9E9E")
-        canvas.drawText("（电脑ai设为普通，对手更易战胜）", px + pw / 2f, py + ph - 72f * ms, buttonTextPaint)
-        canvas.drawText("（最大思考时间仅大师ai生效，越长越强）", px + pw / 2f, py + ph - 36f * ms, buttonTextPaint)
+        canvas.drawText("（大师模式电脑固定走全信息搜索）", px + pw / 2f, py + ph - 72f * ms, buttonTextPaint)
+        canvas.drawText("（思考时间越长，电脑越强也越慢）", px + pw / 2f, py + ph - 36f * ms, buttonTextPaint)
     }
 
     /** 策略二选一开关：选中项高亮（绿），未选中灰 */

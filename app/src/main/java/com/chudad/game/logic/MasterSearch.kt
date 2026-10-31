@@ -79,6 +79,13 @@ internal object MasterSearch {
     private val minPlaysCache = java.util.concurrent.ConcurrentHashMap<Long, Int>()
 
     /**
+     * 缓存容量上限：满即整体清空。
+     * 缓存键是 52 位手牌掩码，长对战（多局 × 每局上千节点）会持续累积，
+     * 不加限制将成为无界内存增长。
+     */
+    private const val MIN_PLAYS_CACHE_MAX = 20_000
+
+    /**
      * 求解当前局面下 myIndex 的最优一手。
      *
      * @param mustContainDiamond3 本手是否必须包含方块 3（整场第一局首手）；为 true 时
@@ -112,7 +119,7 @@ internal object MasterSearch {
             passes = passes
         )
 
-        val rawMoves = generateMoves(state, myIndex)
+        val rawMoves = generateMoves(state, myIndex, forbidTopBigPass = true)
         if (rawMoves.isEmpty()) return null   // 不应发生：自由出牌必有走法
         // 流程性约束先落到根走法集上，使搜索结果本身就是合法的一手
         val rootMoves = applyRootConstraints(rawMoves, myHand, mustContainDiamond3, mustTopBig)
@@ -121,10 +128,11 @@ internal object MasterSearch {
         val counter = longArrayOf(0L)
 
         var bestMove: Move? = rootMoves.first()
+        // 根走法顺序只与牌面有关，排一次即可；后续层把上一层最优手提到首位（PV 优先）
+        var rootOrdered = orderMoves(state, myIndex, rootMoves, isMax = true)
 
         for (depth in 1..MAX_DEPTH) {
             if (cancelled()) break
-            val rootOrdered = orderMoves(state, myIndex, rootMoves, isMax = true)
             var bestVal = -INF
             var localBest: Move? = null
             var alpha = -INF
@@ -145,7 +153,12 @@ internal object MasterSearch {
 
             // 仅采纳完整跑完当前深度的结果
             if (System.currentTimeMillis() <= deadline && counter[0] <= nodeLimit && !cancelled()) {
-                if (localBest != null) bestMove = localBest
+                val best = localBest
+                if (best != null) {
+                    bestMove = best
+                    // 上一层最优手提到首位：下一层更早拿到好上界，提升 alpha-beta 剪枝效率
+                    rootOrdered = listOf(best) + rootOrdered.filter { it !== best }
+                }
                 // 已找到必胜首手，提前结束
                 if (bestVal >= WIN - 1) break
             } else {
@@ -222,7 +235,7 @@ internal object MasterSearch {
         if (depth <= 0) return evaluate(state, myIndex)
 
         val cur = state.cur
-        val moves = generateMoves(state, cur)
+        val moves = generateMoves(state, cur, forbidTopBigPass = cur == myIndex)
         if (moves.isEmpty()) return evaluate(state, myIndex)
 
         val isMax = (cur == myIndex)
@@ -254,13 +267,38 @@ internal object MasterSearch {
         return best
     }
 
-    /** 生成某玩家的全部合法走法（含过牌，若跟牌） */
-    private fun generateMoves(state: State, player: Int): List<Move> {
+    /**
+     * 生成某玩家的全部合法走法（含过牌，若跟牌）
+     * @param forbidTopBigPass 顶大局面下是否禁止过牌（仅敌方有该义务时由我方调用）。
+     *        顶大规则中「能压却过牌」会被判失职、独自承担三家牌分，
+     *        惩罚远重于让出一张大牌，因此对我方直接排除这一选项。
+     */
+    private fun generateMoves(
+        state: State,
+        player: Int,
+        forbidTopBigPass: Boolean = false
+    ): List<Move> {
         val hand = state.hands[player]
         val moves = mutableListOf<Move>()
         val plays = CardRuleEngine.findAllValidPlays(hand, state.top)
-        for (g in plays) moves.add(Move.Play(g))
-        if (state.top != null) moves.add(Move.Pass)   // 跟牌才可过牌；自由出牌必须出
+        // 顶大：下家报单（剩 1 张）时，本家出单张只能是手中最大那张。
+        // 若只在根节点过滤，搜索内部仍会按「可出任意小单张」估计局面，
+        // 搜出的最优线在真实对局中会被引擎兜底改写，导致决策失真。
+        val topBig = state.hands[(player + 1) % 4].size == 1
+        val maxCard = if (topBig) {
+            hand.maxWithOrNull(compareBy({ it.rank }, { it.suit.order }))
+        } else {
+            null
+        }
+        for (g in plays) {
+            if (maxCard != null && g.type == CardType.SINGLE &&
+                g.cards.singleOrNull()?.id != maxCard.id
+            ) continue
+            moves.add(Move.Play(g))
+        }
+        // 跟牌才可过牌；自由出牌必须出。顶大且尚有牌可压时，我方不允许过牌（避免失职）
+        val mayPass = state.top != null && !(forbidTopBigPass && topBig && moves.isNotEmpty())
+        if (mayPass) moves.add(Move.Pass)
         return moves
     }
 
@@ -444,6 +482,7 @@ internal object MasterSearch {
             remaining.removeAt(0); plays++; continue
         }
 
+        if (minPlaysCache.size >= MIN_PLAYS_CACHE_MAX) minPlaysCache.clear()
         minPlaysCache[mask] = plays
         return plays
     }

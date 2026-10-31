@@ -52,6 +52,11 @@ class MainActivity : AppCompatActivity(), GameEngineCallback {
         Difficulty.MASTER to GameStats()
     )
 
+    /** 备份格式版本：仅校验本版本，旧格式不做兼容 */
+    private companion object {
+        const val BACKUP_SCHEMA = 3
+    }
+
     /** 统计持久化：使用 Activity 级 SharedPreferences，进程重启后仍能恢复 */
     private val statsPrefs by lazy { getPreferences(MODE_PRIVATE) }
 
@@ -78,13 +83,12 @@ class MainActivity : AppCompatActivity(), GameEngineCallback {
     }
 
     /**
-     * 大师模式 AI 策略持久化（独立文件，与普通统计无关）
+     * 大师模式设置持久化（独立文件，与普通统计无关）
      *
-     * 存储键 `master_ai_strategy` 表示「大师模式下电脑玩家是否使用全信息搜索」
-     * （锄大D 四人各自为战，不存在队友概念）。
+     * 存储键 `player_hint_strategy` 表示「玩家点提示时是否使用大师全信息搜索」。
+     * 电脑玩家在大师模式下固定走全信息搜索，不再提供开关，故不再存 `master_ai_strategy`。
      */
     private val strategyPrefs by lazy { getSharedPreferences("master_strategy", MODE_PRIVATE) }
-    private var aiMasterStrategy = Difficulty.NORMAL
     private var playerHintStrategy = Difficulty.NORMAL
     private var masterThinkSeconds = 5
 
@@ -94,14 +98,12 @@ class MainActivity : AppCompatActivity(), GameEngineCallback {
     }
 
     private fun loadMasterStrategy() {
-        aiMasterStrategy = loadStrategy("master_ai_strategy", Difficulty.NORMAL)
         playerHintStrategy = loadStrategy("player_hint_strategy", Difficulty.NORMAL)
         masterThinkSeconds = strategyPrefs.getInt("master_think_seconds", 5)
     }
 
     private fun saveMasterStrategy() {
         strategyPrefs.edit().apply {
-            putString("master_ai_strategy", aiMasterStrategy.name)
             putString("player_hint_strategy", playerHintStrategy.name)
             putInt("master_think_seconds", masterThinkSeconds)
             apply()
@@ -132,11 +134,10 @@ class MainActivity : AppCompatActivity(), GameEngineCallback {
     /** 组装备份 JSON（设置 + 双模式统计） */
     private fun buildBackupJson(): String {
         val root = JSONObject()
-        root.put("schema", 2)
+        root.put("schema", BACKUP_SCHEMA)
         root.put("appVersion", BuildConfig.VERSION_NAME)
         root.put("exportedAt", SimpleDateFormat("yyyyMMddHHmm", Locale.getDefault()).format(Date()))
         val settings = JSONObject()
-        settings.put("master_ai_strategy", aiMasterStrategy.name)
         settings.put("player_hint_strategy", playerHintStrategy.name)
         settings.put("masterThinkSeconds", masterThinkSeconds)
         root.put("settings", settings)
@@ -154,29 +155,32 @@ class MainActivity : AppCompatActivity(), GameEngineCallback {
 
     /** 解析备份 JSON，校验 schema 与取值范围；失败时抛异常 */
     private data class ImportedBackup(
-        val aiMaster: Difficulty, val hint: Difficulty, val sec: Int,
+        val hint: Difficulty, val sec: Int,
         val stats: Map<Difficulty, GameStats>
     )
 
     private fun parseBackupJson(text: String): ImportedBackup {
         val root = JSONObject(text)
-        val schema = root.optInt("schema", 1)
-        if (schema !in 1..2) throw IllegalArgumentException("不支持的备份格式")
+        // 只接受当前格式；其他版本的存档一律视为无效，不做兼容
+        if (root.optInt("schema", 0) != BACKUP_SCHEMA) {
+            throw IllegalArgumentException("备份版本不匹配")
+        }
         val settings = root.getJSONObject("settings")
-        val aiMaster = Difficulty.valueOf(settings.optString("master_ai_strategy", Difficulty.NORMAL.name))
-        val hint = Difficulty.valueOf(settings.optString("player_hint_strategy", Difficulty.NORMAL.name))
-        val sec = settings.optInt("masterThinkSeconds", 5).coerceIn(2, 60)
-        val statsObj = root.optJSONObject("stats") ?: JSONObject()
+        val hint = try {
+            Difficulty.valueOf(settings.getString("player_hint_strategy"))
+        } catch (_: IllegalArgumentException) {
+            throw IllegalArgumentException("提示策略取值非法")
+        }
+        val sec = settings.getInt("masterThinkSeconds").coerceIn(2, 60)
+        val statsObj = root.getJSONObject("stats")
         val imported = mutableMapOf<Difficulty, GameStats>()
         for (mode in listOf(Difficulty.NORMAL, Difficulty.MASTER)) {
-            if (statsObj.has(mode.name)) {
-                val o = statsObj.getJSONObject(mode.name)
-                imported[mode] = GameStats(
-                    o.optInt("score", 0), o.optInt("games", 0), o.optInt("wins", 0)
-                )
-            }
+            val o = statsObj.getJSONObject(mode.name)
+            imported[mode] = GameStats(
+                o.getInt("score"), o.getInt("games"), o.getInt("wins")
+            )
         }
-        return ImportedBackup(aiMaster, hint, sec, imported)
+        return ImportedBackup(hint, sec, imported)
     }
 
     private fun exportBackup(uri: Uri) {
@@ -206,6 +210,10 @@ class MainActivity : AppCompatActivity(), GameEngineCallback {
                     pendingImport = parsed
                     gameSurfaceView.requestImportConfirm()
                 }
+            } catch (e: IllegalArgumentException) {
+                // 版本不匹配或字段缺失：提示具体原因，不静默兼容
+                val reason = e.message ?: "文件无效"
+                runOnUiThread { toast("导入失败：$reason") }
             } catch (_: Exception) {
                 runOnUiThread { toast("导入失败：文件无效") }
             }
@@ -216,16 +224,14 @@ class MainActivity : AppCompatActivity(), GameEngineCallback {
     private fun applyImportedBackup() {
         val data = pendingImport ?: return
         pendingImport = null
-        aiMasterStrategy = data.aiMaster
         playerHintStrategy = data.hint
         masterThinkSeconds = data.sec
         for ((m, st) in data.stats) stats[m] = st
         saveMasterStrategy()
         saveStats()
-        gameEngine.aiMasterStrategy = data.aiMaster
         gameEngine.playerHintStrategy = data.hint
         gameEngine.masterDeadlineMs = data.sec * 1000L
-        gameSurfaceView.setMasterStrategy(data.aiMaster, data.hint)
+        gameSurfaceView.setHintStrategy(data.hint)
         gameSurfaceView.setMasterThinkSeconds(data.sec)
         for ((m, st) in stats) gameSurfaceView.setModeStats(m, st.score, st.games, st.wins)
         toast("已导入备份")
@@ -267,18 +273,15 @@ class MainActivity : AppCompatActivity(), GameEngineCallback {
             gameSurfaceView.refresh()
         }
 
-        // 恢复大师模式 AI 策略到引擎与 UI 显示
-        gameEngine.aiMasterStrategy = aiMasterStrategy
+        // 恢复大师模式设置到引擎与 UI 显示（电脑策略固定大师，无需恢复）
         gameEngine.playerHintStrategy = playerHintStrategy
         gameEngine.masterDeadlineMs = masterThinkSeconds * 1000L
-        gameSurfaceView.setMasterStrategy(aiMasterStrategy, playerHintStrategy)
+        gameSurfaceView.setHintStrategy(playerHintStrategy)
         gameSurfaceView.setMasterThinkSeconds(masterThinkSeconds)
 
-        // 主界面设置：大师模式 AI 策略变更（持久化保存并实时生效）
-        gameSurfaceView.onMasterStrategyChange = { aiMaster, hint ->
-            aiMasterStrategy = aiMaster
+        // 主界面设置：「玩家提示ai」策略变更（持久化保存并实时生效）
+        gameSurfaceView.onHintStrategyChange = { hint ->
             playerHintStrategy = hint
-            gameEngine.aiMasterStrategy = aiMaster
             gameEngine.playerHintStrategy = hint
             saveMasterStrategy()
             gameSurfaceView.refresh()

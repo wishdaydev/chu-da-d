@@ -131,6 +131,13 @@ internal object MasterSearch {
     private val oppTopKTL = ThreadLocal<Int>()
 
     /**
+     * 关闭「对手报单终局化」的对照开关（按线程隔离，仅仿真 A/B 用，线上恒为 false）。
+     *
+     * 见 [evaluate] 里的报单判定：为 true 时跳过该判定，退回旧口径（报单威胁只值几百点）。
+     */
+    private val legacyEvalTL = ThreadLocal<Boolean>()
+
+    /**
      * 人类建模节点的决策缓存：单次 solve 内按局面键命中，避免同一人类节点被反复展开时
      * 重复跑 [AIDecision] + 全量走法枚举（深层搜索里这类重复极多）。
      * 用 ThreadLocal 隔离，仿真多线程各用各的表。
@@ -301,6 +308,7 @@ internal object MasterSearch {
         opponentModel: Int? = null,
         opponentTopK: Int? = null,
         maxDepth: Int? = null,
+        legacyEval: Boolean = false,
         cancelled: () -> Boolean = { false }
     ): CardGroup? {
         ctrlWeightTL.set(ctrlWeight ?: W_CTRL)
@@ -308,6 +316,7 @@ internal object MasterSearch {
         humanModelSeatTL.set(humanModelSeat ?: -1)
         oppModelTL.set(opponentModel ?: OPP_SELFISH)
         oppTopKTL.set(opponentTopK ?: 2)
+        legacyEvalTL.set(legacyEval)
         // 先清零：本次若提前返回（无手牌/无走法），调用方读到的必须是 0 而不是上一次的残留值
         lastNodesTL.set(0)
         lastDepthTL.set(0)
@@ -765,9 +774,30 @@ internal object MasterSearch {
      * 手数差这一主项足够区分对手的倾向。
      */
     private fun orderBySelfInterest(state: State, player: Int, moves: List<Move>): List<Move> {
+        // 其余三家的「手数 / 张数」与『本手出什么』无关，循环外算一次即可：
+        // 原实现对每个候选走法都重算一遍这三家（每个对手节点几十次重复查询），
+        // 而它们在整个排序过程中恒定。JFR 实测 orderBySelfInterest 占搜索耗时 11% 量级，
+        // 其中相当一部分就是这类重复查询。
+        var oppPlays = Int.MAX_VALUE
+        var oppCards = Int.MAX_VALUE
+        for (i in 0..3) {
+            if (i == player) continue
+            val h = state.hands[i]
+            if (h.size < oppCards) oppCards = h.size
+            val p = minPlays(h)
+            if (p < oppPlays) oppPlays = p
+        }
+
         val scored = moves.map { mv ->
+            // 候选仍逐手 applyMove/undoMove：quickEval 要看「出完这手之后」的手牌，
+            // 这一步同时保持了 undo 恢复后的手牌顺序，与其它搜索路径保持一致。
             val undo = applyMove(state, player, mv)
-            val v = if (undo.winner == player) WIN else quickEval(state, player)
+            val v = if (undo.winner == player) WIN else {
+                val myPlays = minPlays(state.hands[player])
+                val myCards = state.hands[player].size
+                ((oppPlays - myPlays) * W_PLAYS + (oppCards - myCards) * W_CARDS)
+                    .coerceIn(-WIN / 2, WIN / 2)
+            }
             undoMove(state, undo)
             mv to v
         }
@@ -792,6 +822,22 @@ internal object MasterSearch {
 
     /** 从我视角评估局面：正=我领先，负=我落后 */
     private fun evaluate(state: State, myIndex: Int): Int {
+        // 对手报单（仅剩 1 张）且**轮到他、他又能出** → 他这一手就出完，我必输。
+        //
+        // 深度充足时搜索会自己走到那一步（applyMove 返回 winner），这里补的是**深度边界**：
+        // 旧口径里「对手剩 1 手」只体现为 (oppPlays - myPlays) * 600 的差额（几十到几千分），
+        // 与 WIN（100 万）差三个数量级，alpha-beta 在截断处根本不会为它让路，
+        // 于是常出现「明明下家报单、却在截断层按均势估值」的误判。
+        // 判定条件与搜索的终局判定同源：轮到他（state.cur）且 top 为空或他能压 top。
+        if (legacyEvalTL.get() != true) {
+            val cur = state.cur
+            if (cur != myIndex && state.hands[cur].size == 1 &&
+                (state.top == null || CardRuleEngine.canBeat(state.hands[cur], state.top))
+            ) {
+                return -(WIN - 1)
+            }
+        }
+
         val myPlays = minPlays(state.hands[myIndex])
         val myCards = state.hands[myIndex].size
         var oppPlays = Int.MAX_VALUE
@@ -805,9 +851,10 @@ internal object MasterSearch {
         // 控制权项（Level 1 + 2）：缓解 me-vs-field 联盟建模导致的过度防御。
         // 静态手牌强度（仅依赖自己手牌，零跨玩家依赖）+ 当前出牌权（自由领出 / 跟牌且能压制夺取领出权）。
         // 对手控制力取 max（最坏对手），与 oppPlays 取 min 的"最坏情况"语义一致。
-        // 当前出牌方能否压制由 findAllValidPlays 判定，整局评估仅调用一次（state.cur 恒为单一玩家）。
+        // 当前出牌方能否压制由 canBeat 判定（只看存在性，不枚举全部候选——每个叶节点都会走到这里，
+        // 枚举完整走法列表会把评估成本放大数倍，JFR 实测该处曾占评估耗时的 8%）
         val curCanSeize = state.top != null &&
-            CardRuleEngine.findAllValidPlays(state.hands[state.cur], state.top).isNotEmpty()
+            CardRuleEngine.canBeat(state.hands[state.cur], state.top)
 
         val wCtrl = ctrlWeightTL.get() ?: W_CTRL
         val myCtrl = handStrength(state.hands[myIndex]) + currentPlayerBonus(state, myIndex, curCanSeize)
@@ -849,14 +896,28 @@ internal object MasterSearch {
         return s
     }
 
-    /** 是否存在同花顺（同花色连续 5 张，或 A-2-3-4-5 同花） */
+    /**
+     * 是否存在同花顺（同花色连续 5 张，或 A-2-3-4-5 同花）。
+     *
+     * 用「每花色一个 16 位点数掩码 + 窗口与运算」实现：原写法对每个花色都 filter/toSet 一遍
+     * 并生成新列表，而本函数在评估里对 4 家手牌各调一次（每个叶节点 4 次），
+     * JFR 实测占评估耗时的 8.6%，是该处最大的单点开销。
+     */
     private fun hasStraightFlush(cards: List<Card>): Boolean {
+        if (cards.size < 5) return false
+        val suitMask = LongArray(4)
+        for (c in cards) suitMask[c.suit.order] = suitMask[c.suit.order] or (1L shl c.rank)
         for (s in 0..3) {
-            val ranks = cards.filter { it.suit.order == s }.map { it.rank }.toSet()
+            val m = suitMask[s]
+            if (java.lang.Long.bitCount(m) < 5) continue
             for (start in 3..10) {
-                if ((start..start + 4).all { it in ranks }) return true
+                var win = 0L
+                for (k in 0..4) win = win or (1L shl (start + k))
+                if (m and win == win) return true
             }
-            if (A2345.all { it in ranks }) return true   // A-2-3-4-5（A 作 1）
+            // A-2-3-4-5（A 作 1）：3,4,5,14,15
+            val a2345 = (1L shl 3) or (1L shl 4) or (1L shl 5) or (1L shl 14) or (1L shl 15)
+            if (m and a2345 == a2345) return true
         }
         return false
     }
@@ -873,6 +934,13 @@ internal object MasterSearch {
      * 把手牌拆成「最少合法牌组数」的贪心估计（越小越接近出完）。
      * 非精确下界，但各玩家一致，比较有含义；用于评估与排序。
      * 直接基于剩余牌列表就地移除，避免 rank 计数与花色索引不同步导致误判。
+     *
+     * **输入先排序**：贪心每一步都取「最长/第一个」组合，结果与列表顺序有关；
+     * 而缓存键是集合掩码（不含顺序）。若不排序，同一手牌集合在不同顺序下会算出不同值，
+     * 命中缓存时返回的是「首次计算时那个顺序」的结果——它会随搜索路径、乃至缓存
+     * 清空时机漂移（`minPlaysCache` 到 2 万条会整体清空）。实测表现就是：
+     * 同 seed、同固定节点预算，多线程跑两次得到的胜负分布不同，仿真结论因而不可复现。
+     * 排序后本函数成为纯函数，缓存命中即恒等，A/B 对比才有意义。
      */
     private fun minPlays(cards: List<Card>): Int {
         if (cards.isEmpty()) return 0
@@ -880,7 +948,7 @@ internal object MasterSearch {
         for (c in cards) mask = mask or cardMask(c)
         minPlaysCache[mask]?.let { return it }
 
-        val remaining = cards.toMutableList()
+        val remaining = cards.sortedWith(compareBy({ it.rank }, { it.suit.order })).toMutableList()
         var plays = 0
 
         while (remaining.isNotEmpty()) {

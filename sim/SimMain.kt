@@ -83,6 +83,12 @@ fun main(args: Array<String>) {
         ?.mapNotNull { it.trim().toIntOrNull() }?.filter { it in 0..3 }?.toSet()
         ?: emptySet()
 
+    // 大师模式 A/B：这些座位用「旧评估」（不做对手报单终局化），其余座位用新评估。
+    // 四家全大师、新评估坐 0/2、旧评估坐 1/3 时，偏离 50% 即为新评估的强度增益。
+    val legacyEvalSeats: Set<Int> = System.getenv("LEGACY_EVAL_SEATS")?.split(',')
+        ?.mapNotNull { it.trim().toIntOrNull() }?.filter { it in 0..3 }?.toSet()
+        ?: emptySet()
+
     // 按座位覆盖节点预算：用于「弱搜索 vs 强搜索」「同源不同算力」的强度对照，
     // 例如 NODE_LIMIT_SEATS="0:10000" 让 0 号位每步只用 1 万节点，其余座位按位置参数给的预算。
     val seatNodeLimit: Map<Int, Int> = System.getenv("NODE_LIMIT_SEATS")
@@ -100,7 +106,8 @@ fun main(args: Array<String>) {
             "nodeLimit=$nodeLimit threads=$threads baseSeed=$baseSeed " +
             "HUMAN_MODEL_SEAT=$humanSeat HUMAN_MODEL_WEIGHT=$humanWeight " +
             "HEURISTIC_SEATS=$heuristicSeats SELFISH_SEATS=$selfishSeats K=$oppTopK " +
-            "MAX_DEPTH=${maxDepth ?: "自动"} LEGACY_SEATS=$legacySeats SEAT_NODES=$seatNodeLimit"
+            "MAX_DEPTH=${maxDepth ?: "自动"} LEGACY_SEATS=$legacySeats SEAT_NODES=$seatNodeLimit " +
+                    "LEGACY_EVAL_SEATS=$legacyEvalSeats"
     )
 
     val wins = IntArray(4)
@@ -121,7 +128,7 @@ fun main(args: Array<String>) {
         try {
             val r = playGame(
                 seed, deadlineMs, nodeLimit, humanSeat, humanWeight,
-                heuristicSeats, oppTopK, selfishSeats, maxDepth, legacySeats, seatNodeLimit
+                heuristicSeats, oppTopK, selfishSeats, maxDepth, legacySeats, seatNodeLimit, legacyEvalSeats
             )
             synchronized(wins) { if (r.winner in 0..3) wins[r.winner]++ }
             totalMoves.addAndGet(r.moves.toLong())
@@ -225,7 +232,8 @@ private fun playGame(
     selfishSeats: Set<Int>,
     maxDepth: Int?,
     legacySeats: Set<Int> = emptySet(),
-    seatNodeLimit: Map<Int, Int> = emptyMap()
+    seatNodeLimit: Map<Int, Int> = emptyMap(),
+    legacyEvalSeats: Set<Int> = emptySet()
 ): GameResult {
     val hands = deal(seed)
     // 真实开局：持 ♦3 者先出，且首手必须含 ♦3。
@@ -274,7 +282,8 @@ private fun playGame(
                 initialPlayedMask = playedMask,
                 opponentModel = if (cur in selfishSeats) 1 else 0,
                 opponentTopK = oppTopK,
-                maxDepth = maxDepth
+                maxDepth = maxDepth,
+                legacyEval = cur in legacyEvalSeats
             ).also {
                 steps++
                 nodesSum += MasterSearch.lastSearchNodes

@@ -176,6 +176,47 @@ object CardRuleEngine {
         return compare(played, lastPlay) > 0
     }
 
+    /**
+     * 「能不能压住」的存在性判定：与 [findAllValidPlays]`(hand, lastPlay).isNotEmpty()` 语义等价，
+     * 但不构造完整候选列表、命中即返回。
+     *
+     * 存在意义：大师搜索在**每个叶节点**都要判断「当前出牌方能否接住桌面上这手」，
+     * 只为拿到一个布尔值却枚举全部候选（含所有五张牌型组合）是纯浪费——JFR 实测该处
+     * 占评估耗时的 8% 以上。单张/对子/三条改用点数+花色位掩码直接判定（O(手牌)，
+     * 无对象分配）；五张牌型仍走生成器，但用 [Sequence] 语义短路在第一个可压组合处返回。
+     */
+    fun canBeat(hand: List<Card>, lastPlay: CardGroup?): Boolean {
+        if (hand.isEmpty()) return false
+        // 自由出牌：手里有牌就一定能出
+        if (lastPlay == null || lastPlay.type == CardType.INVALID) return true
+
+        val n = lastPlay.cards.size
+        if (n == STRAIGHT_LEN) {
+            val sorted = hand.sortedWith(compareBy({ it.rank }, { it.suit.order }))
+            return genFiveCardPlays(sorted).any { isValidPlay(it, lastPlay) }
+        }
+        // 张数不匹配的单张/对子/三条：直接判否（与 isValidPlay 的张数校验一致）
+        if (n !in 1..3) return false
+
+        // 每个点数的花色掩码：bit s = 有该花色的牌
+        val suitMask = IntArray(16)
+        for (c in hand) suitMask[c.rank] = suitMask[c.rank] or (1 shl c.suit.order)
+
+        // 点数更大且张数够 → 直接能压
+        for (r in (lastPlay.mainRank + 1)..RANK_TWO) {
+            if (Integer.bitCount(suitMask[r]) >= n) return true
+        }
+        // 同点数：比该组的 topSuitOrder，即「这个点数里我手上最大的花色」。
+        // 注意不是第 n 大的花色——[CardGroup.topSuitOrder] 取的是整组最大花色。
+        // 三条不可能同点（同点数全场只有 4 张，对手已用掉 3 张）。
+        if (Integer.bitCount(suitMask[lastPlay.mainRank]) >= n) {
+            for (s in 3 downTo 0) {
+                if (suitMask[lastPlay.mainRank] and (1 shl s) != 0) return s > lastPlay.topSuitOrder
+            }
+        }
+        return false
+    }
+
     // ============================== 候选生成 ==============================
 
     /**

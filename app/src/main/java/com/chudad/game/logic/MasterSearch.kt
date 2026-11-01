@@ -336,7 +336,7 @@ internal object MasterSearch {
             passes = passes
         )
 
-        val rawMoves = generateMoves(state, myIndex, forbidTopBigPass = true)
+        val rawMoves = generateMoves(state, myIndex)
         if (rawMoves.isEmpty()) return null   // 不应发生：自由出牌必有走法
         // 流程性约束先落到根走法集上，使搜索结果本身就是合法的一手
         val rootMoves = applyRootConstraints(rawMoves, myHand, mustContainDiamond3, mustTopBig)
@@ -487,7 +487,7 @@ internal object MasterSearch {
         }
 
         val cur = state.cur
-        val moves = generateMoves(state, cur, forbidTopBigPass = cur == myIndex)
+        val moves = generateMoves(state, cur)
         if (moves.isEmpty()) return evaluate(state, myIndex)
 
         val isMax = (cur == myIndex)
@@ -538,16 +538,18 @@ internal object MasterSearch {
     }
 
     /**
-     * 生成某玩家的全部合法走法（含过牌，若跟牌）
-     * @param forbidTopBigPass 顶大局面下是否禁止过牌（仅敌方有该义务时由我方调用）。
-     *        顶大规则中「能压却过牌」会被判失职、独自承担三家牌分，
-     *        惩罚远重于让出一张大牌，因此对我方直接排除这一选项。
+     * 生成某玩家的全部合法走法（含过牌，若跟牌）。
+     *
+     * 顶大（下家报单）的两条约束对**所有玩家**一视同仁——人类、普通 AI、大师 AI 在执行层
+     * 都会被引擎强制，搜索若放宽就会搜出真实对局里根本走不出的线：
+     *  1. 出单张只能是手中最大的那张（下面的 maxCard 过滤）；
+     *  2. 桌面是一手单张、且手中有能压过它的单张时，不允许过牌。
+     *
+     * 第 2 条只在**桌面确实是单张**时成立：桌面对子/三条时顶大只管「单张必须是最大」，
+     * 并不禁止过牌 —— 与 [GameEngine.mustTopBigPlay] 内部要求 `last.type == SINGLE` 同口径。
+     * 旧实现只判断「下家报单」，桌面对子时也把过牌剪掉，搜索结果因此少了一个合法选项。
      */
-    private fun generateMoves(
-        state: State,
-        player: Int,
-        forbidTopBigPass: Boolean = false
-    ): List<Move> {
+    private fun generateMoves(state: State, player: Int): List<Move> {
         // 人类建模分支（仅仿真/实验）：把指定座位当成普通模式 [AIDecision] 代理，
         // 只生成其启发式走法而非穷举。权重 0 / 关闭时直接走下方全量展开，与现行行为一致。
         val hmSeat = humanModelSeatTL.get() ?: -1
@@ -574,8 +576,14 @@ internal object MasterSearch {
             ) continue
             moves.add(Move.Play(g))
         }
-        // 跟牌才可过牌；自由出牌必须出。顶大且尚有牌可压时，我方不允许过牌（避免失职）
-        val mayPass = state.top != null && !(forbidTopBigPass && topBig && moves.isNotEmpty())
+        // 跟牌才可过牌；自由出牌必须出。
+        // 顶大强制（能压必须出）只在桌面是单张、且过滤后仍有单张可出时成立；
+        // 没有可压的单张（moves 里没有任何单张）时过牌合法，与引擎 mustTopBigPlay 同口径。
+        // 注：桌面为单张时同张数规则决定了 moves 里只可能是单张，故此处判定等价于
+        // 「存在能压过桌面的单张」。
+        val topBigMustPlay = topBig && state.top?.type == CardType.SINGLE &&
+            moves.any { it is Move.Play && it.group.type == CardType.SINGLE }
+        val mayPass = state.top != null && !topBigMustPlay
         if (mayPass) moves.add(Move.Pass)
         return moves
     }

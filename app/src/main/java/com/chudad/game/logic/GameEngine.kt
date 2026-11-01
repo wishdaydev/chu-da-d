@@ -411,7 +411,6 @@ class GameEngine {
         if (stateMachine.mustPlay()) return   // 自由出牌 / 自己压自己时不能过
         if (mustTopBigPlay(0)) return         // 顶大义务：能压必须出最大单张，不可过牌
 
-        recordTopBigFailIfNeeded(0)
         processPass(0)
     }
 
@@ -453,15 +452,6 @@ class GameEngine {
         val max = players[playerIndex].handCards
             .maxWithOrNull(compareBy({ it.rank }, { it.suit.order })) ?: return false
         return max.id == card.id
-    }
-
-    /**
-     * 顶大失职标记：下家报单时选择「不出」，且手中本有能压过桌面单张的牌 → 记一次失职。
-     * 该玩家一旦实际出牌（任意牌型）即清除，符合「不强制只能出单张」的语义。
-     */
-    private fun recordTopBigFailIfNeeded(playerIndex: Int) {
-        if (!mustTopBig(playerIndex)) return
-        if (canTopBigWithSingle(playerIndex)) stateMachine.topBigFailIndex = playerIndex
     }
 
     private fun containsDiamond3(cards: List<Card>): Boolean =
@@ -632,7 +622,6 @@ class GameEngine {
                 return
             }
         }
-        recordTopBigFailIfNeeded(playerIndex)
         processPass(playerIndex)
     }
 
@@ -660,7 +649,14 @@ class GameEngine {
     /** 获取某玩家的合法剩余手牌数 */
     fun getCardCount(index: Int): Int = legalCardCount(index)
 
-    /** 顶大失职玩家索引（结算用）：-1 表示本轮无失职 */
+    /**
+     * 顶大失职玩家索引（结算用）：-1 表示本轮无失职。
+     *
+     * 当前规则下**恒为 -1**：顶大义务是硬约束（[mustTopBigPlay] 为 true 时人类点「不出」
+     * 会被 UI 与引擎双双拒绝，AI 也会被 [applyAIDecision] 强制改判为出最大单张），
+     * 不存在「能顶却过牌」的路径，因此结算永远不会命中「顶大失职·包赔/代付」分支。
+     * 该字段与结算分支保留，是为了将来若改为「允许过牌 + 罚分」的宽松规则时可直接复用。
+     */
     val topBigFailIndex: Int get() = stateMachine.topBigFailIndex
 
     /**

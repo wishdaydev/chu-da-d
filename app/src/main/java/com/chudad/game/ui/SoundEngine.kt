@@ -323,6 +323,15 @@ class SoundEngine {
      */
     private fun writeAll(t: AudioTrack, buf: ShortArray, gen: Int): Boolean {
         try {
+            // 非播放状态下先清空残留缓冲。
+            //
+            // pause / stop 期间写入的数据 AudioTrack 不会消费，会一直堆在环形缓冲里，
+            // 等下一次 play() 成功时连同新音效一起播出来——听感就是「这一声没响，
+            // 下一次连响两声」。播放中不能 flush（会把正在发声的波形截断成爆音），
+            // 但非播放状态下缓冲里的都是「卡住没播」的死数据，清掉正是目的。
+            if (t.playState != AudioTrack.PLAYSTATE_PLAYING) {
+                try { t.flush() } catch (_: Exception) {}
+            }
             var off = 0
             val startMs = SystemClock.uptimeMillis()
             while (off < buf.size) {
@@ -352,13 +361,13 @@ class SoundEngine {
                 // 每次都查实时 playState：stop() 可能在中途把 track 暂停，
                 // 缓存的状态会让这里一直 sleep 到超时
                 if (t.playState != AudioTrack.PLAYSTATE_PLAYING) {
-                    t.play()
+                    startPlayback(t)
                 } else {
                     Thread.sleep(WRITE_POLL_MS)
                 }
             }
             // 整段比缓冲还短时（一次就写完），此时还没起播
-            if (t.playState != AudioTrack.PLAYSTATE_PLAYING) t.play()
+            if (t.playState != AudioTrack.PLAYSTATE_PLAYING) startPlayback(t)
             return true
         } catch (e: InterruptedException) {
             Thread.currentThread().interrupt()
@@ -366,6 +375,25 @@ class SoundEngine {
         } catch (e: Exception) {
             Log.w(TAG, "AudioTrack 写入异常：${e.javaClass.simpleName}: ${e.message}")
             return false
+        }
+    }
+
+    /**
+     * 起播，并复核是否真的进入播放态。
+     *
+     * `AudioTrack.play()` 不返回错误码，失败时抛 IllegalStateException；但它也可能
+     * 悄悄没生效（playState 仍停在 PAUSED）。一旦如此，本段数据就留在缓冲里不播——
+     * 用户听到的正是「点了没声音」；等下一次点击 play 成功，两段数据连在一起出来，
+     * 就成了「快速响两声」。所以这里必须留痕，否则线上无从判断该不该重建 track。
+     */
+    private fun startPlayback(t: AudioTrack) {
+        try {
+            t.play()
+            if (t.playState != AudioTrack.PLAYSTATE_PLAYING) {
+                Log.w(TAG, "AudioTrack.play 未生效，playState=${t.playState}")
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "AudioTrack.play 异常：${e.javaClass.simpleName}: ${e.message}")
         }
     }
 
@@ -530,14 +558,35 @@ class SoundEngine {
                 )
             )
             val tail = mix(listOf(note(523.25, 0.5, 0.25), note(659.25, 0.5, 0.2), note(783.99, 0.5, 0.2)))
-            concat(seq, offset(tail, (seq.size * 0.75).toInt()))
+            // 尾音和声从琶音 75% 处混入、并向后续延伸。
+            //
+            // 旧版写的是 concat(seq, offset(tail, (seq.size * 0.75).toInt()))：
+            // skip 是 25137，而 tail 只有 22050 —— offset 越界直接返回空数组，
+            // 这一整层和声从来没响过；而且 concat 只能接在末尾，本来就表达不了
+            // 「从中间叠进去」。这里改成按偏移 addInto，才是注释里写的那个效果。
+            val start = (seq.size * 0.75).toInt()
+            val out = DoubleArray(maxOf(seq.size, start + tail.size))
+            seq.copyInto(out)
+            for (i in tail.indices) out[start + i] += tail[i]
+            out
         }
         Sfx.LOSE -> tones(listOf(440.0 to 0.16, 349.23 to 0.16, 261.63 to 0.34))
         Sfx.LAST_CARD -> concat(tones(listOf(1560.0 to 0.09)), tones(listOf(1980.0 to 0.12)))
-        Sfx.ERROR -> concat(
-            thud(160.0, 0.10, 0.7),
-            offset(thud(140.0, 0.12, 0.7), (SAMPLE_RATE * 0.13).toInt())
-        )
+        Sfx.ERROR -> {
+            // 双"咚"。旧版有两个坑，合起来就是"报错没声音"：
+            //  1) 频率太低：旧版是 160Hz / 140Hz 的纯正弦脉冲。手机小扬声器在 200Hz
+            //     以下衰减极快，这种音基本放不出声——合成上确实有波形，喇叭上没输出。
+            //  2) 第二声被吞：旧版用 offset 跳过 0.13s 去取第二声，而单声只有 0.12s，
+            //     skip 越过数组末尾会返回空数组，于是"双咚"退化成一声 100ms 的闷响。
+            // 现在频率抬到 400Hz 以上，并用等长静音留白代替偏移取段。
+            // 每声前面叠 8ms 噪声起音：给低频脉冲一个可听的高频边缘（"哒"），
+            // 否则纯低频在中低端机型上仍然容易糊掉。
+            val a = thud(460.0, 0.09, 0.72)
+            addInto(a, tick(0.008, 0.35))
+            val b = thud(340.0, 0.12, 0.70)
+            addInto(b, tick(0.008, 0.30))
+            concat(a, concat(silence(0.035), b))
+        }
         Sfx.CONFIRM -> tones(listOf(1046.5 to 0.10))
     }
 
@@ -566,7 +615,7 @@ class SoundEngine {
         return result
     }
 
-    /** 低频闷响（无高频成分，像拍桌子） */
+    /** 低频闷响（无高频成分，像拍桌子）。注意：低于约 200Hz 的成分在手机小扬声器上几乎放不出 */
     private fun thud(freq: Double, durSec: Double, gain: Double): DoubleArray {
         val n = (SAMPLE_RATE * durSec).toInt()
         val out = DoubleArray(n)
@@ -577,6 +626,25 @@ class SoundEngine {
         }
         return out
     }
+
+    /**
+     * 极短白噪声起音（"哒"）。
+     *
+     * 用来给低频脉冲加一个可听的高频边缘：纯低频在中低端机型的扬声器上衰减很大，
+     * 单靠 thud 可能糊成一片或者干脆听不见。8ms 足够被感知为"起音"，又不至于变成爆音。
+     */
+    private fun tick(durSec: Double, gain: Double): DoubleArray {
+        val n = (SAMPLE_RATE * durSec).toInt()
+        val out = DoubleArray(n)
+        for (i in 0 until n) {
+            val k = i / n.toDouble()
+            out[i] = (Random.Default.nextDouble() * 2.0 - 1.0) * exp(-k * 4.0) * gain
+        }
+        return out
+    }
+
+    /** 纯静音段，用于两声音之间留白（比用 [offset] 跳段安全：不会因为越界而整段消失） */
+    private fun silence(durSec: Double): DoubleArray = DoubleArray((SAMPLE_RATE * durSec).toInt())
 
     /** 噪声下滑音：模拟纸牌摩擦空气的"唰" */
     private fun sweepNoise(durSec: Double, fStart: Double, fEnd: Double, gain: Double): DoubleArray {

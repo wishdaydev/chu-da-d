@@ -1034,8 +1034,13 @@ class GameSurfaceView(context: Context) : SurfaceView(context), SurfaceHolder.Ca
                 for (btn in currentButtons) {
                     if (btn.rect.contains(x, y)) {
                         pressedAction = btn.action
-                        // “提示”按钮不振动
+                        // “提示”按钮不振动（沿用原有约定，避免误触时震一下）
                         if (btn.action != "hint") hapticButtonPress()
+                        // 按下音只补给自己有音效的按钮：出牌（唰）、提示（叮）。不出 / 重开 /
+                        // 返回 / 设置原本就是纯振动，给它们补一声等于凭空多个声音，不做。
+                        // 理由：动作音要等 ACTION_UP 且要过校验，而触感在按下就给了，中间那
+                        // 80~120ms 正是「按了好像没反应」的来源；这一声只负责对齐触感。
+                        if (btn.action == "play" || btn.action == "hint") sfx { it.press() }
                         refresh()
                         return true
                     }

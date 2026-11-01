@@ -30,7 +30,8 @@ import kotlin.math.max
 
 /**
  * 游戏主绘制视图（横屏模式）
- * 布局（锄大D 4 人各自为战）：三台电脑一字排开位于屏幕上方（电脑A 左上、电脑B 中上、电脑C 右上），底部为人类玩家手牌；
+ * 布局（锄大D 4 人各自为战）：三台电脑一字排开位于屏幕上方（电脑A 右上、电脑B 中上、电脑C 左上），底部为人类玩家手牌；
+ * 座位沿逆时针递增（0底 → 1右上 → 2中上 → 3左上），与锄大地通行出牌方向一致；
  * 中央桌面区按出牌者所在方位展示最新一手牌（同一时刻仅展示最新一手）
  * 支持：滑动选牌、当前回合高亮、计分显示、音效反馈、按钮按压反馈
  */
@@ -340,7 +341,7 @@ class GameSurfaceView(context: Context) : SurfaceView(context), SurfaceHolder.Ca
     /** 当前按下的按钮动作（按下时记录，释放时执行，避免按钮列表重建导致索引错位） */
     private var pressedAction: String? = null
 
-    /** 所有玩家的桌面出牌展示（0=你/底部, 1=电脑A/右, 2=电脑B/左, 3=电脑C/上）；同一时刻仅展示最新一手 */
+    /** 所有玩家的桌面出牌展示（0=你/底部, 1=电脑A/右上, 2=电脑B/中上, 3=电脑C/左上，座位逆时针递增）；同一时刻仅展示最新一手 */
     private val tablePlayedCards = arrayOfNulls<List<Card>>(4)
     /** 退场动画：出牌瞬间捕获"桌上正在展示的那一手"（无论属于哪个槽位）作为退场对象，
      *  在其自身槽位坐标处下移 + 淡出，与新牌入场同步（覆盖"下家出牌、上家旧牌退出"的常见场景） */
@@ -355,7 +356,7 @@ class GameSurfaceView(context: Context) : SurfaceView(context), SurfaceHolder.Ca
     private val PASS_BUBBLE_TEXT_SIZE = AI_THINKING_TIP_TEXT_SIZE
 
     /** 「不出」气泡状态：各玩家槽位最近一次过牌的时间戳与代号（-1 表示无气泡；新一轮由 clearAllPlayedCards 清除）
-     *  长度为 4：锄大D 四人局（0=你, 1=电脑A, 2=电脑B, 3=电脑C） */
+     *  长度为 4：锄大D 四人局（0=你, 1=电脑A, 2=电脑B, 3=电脑C；索引沿逆时针递增） */
     private val passAnimStart = LongArray(4)
     private val passSlotEpoch = IntArray(4) { -1 }
 
@@ -370,7 +371,7 @@ class GameSurfaceView(context: Context) : SurfaceView(context), SurfaceHolder.Ca
      *  过牌即"行动完毕"：同时清除该玩家槽位的桌面出牌展示，避免旧牌与其「不出」同屏矛盾；
      *  并清空其它玩家的过期气泡（轮到谁、谁的气泡就该消失），防止残留误导。 */
     fun registerPassBubble(playerIndex: Int) {
-        if (playerIndex !in 0..3) return   // 4 人局：0=你, 1/2/3=电脑A/B/C
+        if (playerIndex !in 0..3) return   // 4 人局：0=你, 1/2/3=电脑A/B/C（索引逆时针递增）
         tablePlayedCards[playerIndex] = null
         playAnimEnd[playerIndex] = 0L
         for (i in passSlotEpoch.indices) {
@@ -1439,9 +1440,10 @@ class GameSurfaceView(context: Context) : SurfaceView(context), SurfaceHolder.Ca
         drawBackground(canvas)
         drawTopBar(canvas)
         // 锄大D 发牌即开局，原底部三张底牌区域已整体移除，
-        // 顶部一排由三台电脑的信息面板占用（电脑A 左上、电脑B 中上、电脑C 右上）
+        // 顶部一排由三台电脑的信息面板占用（电脑A 右上、电脑B 中上、电脑C 左上）
 
-        // 横屏 4 人布局：三台电脑一字排开位于屏幕上方（电脑A 左上、电脑B 中上、电脑C 右上），你位于底部
+        // 横屏 4 人布局：三台电脑一字排开位于屏幕上方（电脑A 右上、电脑B 中上、电脑C 左上），你位于底部
+        // 出牌方向沿逆时针：0底 → 1右上(电脑A) → 2中上(电脑B) → 3左上(电脑C) → 0，下家在右手边
         if (gameEngine.stateMachine.phase != GamePhase.MENU) {
             for (i in 1..3) {
                 val (ax, ay) = aiSlotCenter(i)
@@ -1631,18 +1633,21 @@ class GameSurfaceView(context: Context) : SurfaceView(context), SurfaceHolder.Ca
     }
 
     /**
-     * 三位电脑玩家的信息区锚点（横屏 4 人局）：电脑A 顶部左、电脑B 顶部中、电脑C 顶部右，
-     * 三台电脑一字排开位于屏幕上方，与底部"你"构成连贯出牌环（0底→1左上→2中上→3右上→0）。
+     * 三位电脑玩家的信息区锚点（横屏 4 人局）：电脑A 顶部右、电脑B 顶部中、电脑C 顶部左。
+     *
+     * 三台电脑一字排开位于屏幕上方，与底部「你」构成**逆时针**出牌环：
+     * 0底 → 1右上(电脑A) → 2中上(电脑B) → 3左上(电脑C) → 0（锄大地通行方向，下家在右手边）。
+     * 名字与索引绑定（A=1、B=2、C=3），所以屏幕从左到右读作 C、B、A，出牌顺序是 你→A→B→C。
      * 集中在此统一定义，供 drawAIPlayer / drawAiTurnTip / aiInfoBounds 共用，避免多处坐标各写一份而失配。
      * @return Pair(centerX, topY)
      */
     private fun aiSlotCenter(playerIndex: Int): Pair<Float, Float> = when (playerIndex) {
-        1 -> (260f * uiScale) to 100f                  // 电脑A：顶部左
+        1 -> (screenWidth - 260f * uiScale) to 100f    // 电脑A：顶部右（你的逆时针下家）
         2 -> (screenWidth / 2f) to 100f               // 电脑B：顶部中
-        else -> (screenWidth - 260f * uiScale) to 100f // 电脑C：顶部右
+        else -> (260f * uiScale) to 100f               // 电脑C：顶部左
     }
 
-    /** 横屏AI玩家区域（屏幕上方一字排开：电脑A 左上、电脑B 中上、电脑C 右上，文字放大2.5倍，牌放大2倍） */
+    /** 横屏AI玩家区域（屏幕上方一字排开：电脑A 右上、电脑B 中上、电脑C 左上，文字放大2.5倍，牌放大2倍） */
     private fun drawAIPlayer(canvas: Canvas, playerIndex: Int, centerX: Float, topY: Float) {
         val player = gameEngine.players[playerIndex]
         val sm = gameEngine.stateMachine
@@ -1708,7 +1713,7 @@ class GameSurfaceView(context: Context) : SurfaceView(context), SurfaceHolder.Ca
         textPaint.color = Palette.gold
         canvas.drawText("${player.cardCount}张", centerX, topY + 54f * uiScale, textPaint)
 
-        // 玩家名称（你/电脑A/电脑B/电脑C），颜色灰白色
+        // 玩家名称（你 / 右上电脑A / 中上电脑B / 左上电脑C），颜色灰白色
         textPaint.textSize = 38f * uiScale
         textPaint.color = Palette.textLightGray
         canvas.drawText(player.name, centerX, topY + 108f * uiScale, textPaint)
@@ -1805,18 +1810,21 @@ class GameSurfaceView(context: Context) : SurfaceView(context), SurfaceHolder.Ca
     }
 
     /**
-     * 桌面出牌展示的 4 个槽位（横屏 4 人局，按玩家方位分布，互不重叠）：
+     * 桌面出牌展示的 4 个槽位（横屏 4 人局，按玩家方位分布，互不重叠）。
+     *
+     * 座位索引沿**逆时针**递增（与锄大地通行规则一致）：0 底 → 1 顶部右 → 2 顶部中 →
+     * 3 顶部左 → 0。俯视这张桌子时，当前玩家的下一家在他**右手边**。
      * - 你(0)：底部中间 0.50W / 0.59H（偏下，位于按钮区下方、手牌上方）
-     * - 电脑A(1)：顶部左 0.22W / 0.40H
+     * - 电脑A(1)：顶部右 0.78W / 0.40H
      * - 电脑B(2)：顶部中 0.50W / 0.36H（略高，正对顶部中上的电脑B面板）
-     * - 电脑C(3)：顶部右 0.78W / 0.40H
+     * - 电脑C(3)：顶部左 0.22W / 0.40H
      * @return Pair(centerX, centerY)
      */
     private fun tableSlotCenter(slot: Int): Pair<Float, Float> = when (slot) {
         0 -> (screenWidth * 0.50f) to (screenHeight * 0.59f)   // 你（底部）
-        1 -> (screenWidth * 0.22f) to (screenHeight * 0.40f)   // 电脑A（顶部左）
+        1 -> (screenWidth * 0.78f) to (screenHeight * 0.40f)   // 电脑A（顶部右）
         2 -> (screenWidth * 0.50f) to (screenHeight * 0.36f)   // 电脑B（顶部中）
-        else -> (screenWidth * 0.78f) to (screenHeight * 0.40f)// 电脑C（顶部右）
+        else -> (screenWidth * 0.22f) to (screenHeight * 0.40f)// 电脑C（顶部左）
     }
 
     /** 桌面中央展示当前最新一手出牌（4 个槽位，各槽位附近标注出牌者名字） */
@@ -2186,8 +2194,8 @@ class GameSurfaceView(context: Context) : SurfaceView(context), SurfaceHolder.Ca
     // ==================== 结算时显示所有玩家剩余牌（正面） ====================
 
     private fun drawAllRemainingCards(canvas: Canvas) {
-        // 结算/结束时，把三个电脑的剩余牌显示到屏幕上方三条横向牌带（左=A / 中=B / 右=C，
-        // 与游戏进行时的顶部方位一致），互不重叠
+        // 结算/结束时，把三个电脑的剩余牌显示到屏幕上方三条横向牌带（左=C / 中=B / 右=A，
+        // 与游戏进行时的顶部方位一致：座位沿逆时针递增，电脑C 在左上、电脑A 在右上），互不重叠
         val backY = 100f + aiPanelH + 16f   // 与 drawAIPlayer 中牌背位置一致：topY + panelH + 16f
         val miniW = 90f
         val miniH = 126f
@@ -2197,23 +2205,23 @@ class GameSurfaceView(context: Context) : SurfaceView(context), SurfaceHolder.Ca
         // 4 人局：屏宽扣掉两侧边距与两条缝隙后三等分，左/中/右各一条牌带，互不重叠
         val bandW = (screenWidth - margin * 2f - centerGap * 2f) / 3f
 
-        // 顶部左AI（电脑A）剩余牌：贴左边缘起排（按人类手牌的聚类+从大到小规则呈现）
+        // 顶部左AI（电脑C）剩余牌：贴左边缘起排（按人类手牌的聚类+从大到小规则呈现）
         drawRemainingRow(
-            canvas, gameEngine.getGroupedHand(1),
+            canvas, gameEngine.getGroupedHand(3),
             bandLeft = margin, bandRight = margin + bandW,
-            backY, miniW, miniH, miniGap, "电脑A剩余", leftAlign = true
+            backY, miniW, miniH, miniGap, gameEngine.players[3].name + "剩余", leftAlign = true
         )
         // 顶部中AI（电脑B）剩余牌：中间牌带内排布
         drawRemainingRow(
             canvas, gameEngine.getGroupedHand(2),
             bandLeft = margin + bandW + centerGap, bandRight = margin + bandW * 2f + centerGap,
-            backY, miniW, miniH, miniGap, "电脑B剩余", leftAlign = true
+            backY, miniW, miniH, miniGap, gameEngine.players[2].name + "剩余", leftAlign = true
         )
-        // 顶部右AI（电脑C）剩余牌：贴右边缘排布，向左延伸到本条牌带左缘为止
+        // 顶部右AI（电脑A）剩余牌：贴右边缘排布，向左延伸到本条牌带左缘为止
         drawRemainingRow(
-            canvas, gameEngine.getGroupedHand(3),
+            canvas, gameEngine.getGroupedHand(1),
             bandLeft = margin + (bandW + centerGap) * 2f, bandRight = screenWidth - margin,
-            backY, miniW, miniH, miniGap, "电脑C剩余", leftAlign = false
+            backY, miniW, miniH, miniGap, gameEngine.players[1].name + "剩余", leftAlign = false
         )
     }
 
@@ -2262,8 +2270,8 @@ class GameSurfaceView(context: Context) : SurfaceView(context), SurfaceHolder.Ca
 
     /** 某 AI 玩家信息区真实包围盒（信息面板 + 牌背扇形 + 可能的「不出」气泡），
      *  用于让「轮到出牌」高亮框精确包住并略大于该信息区域。
-     *  坐标与 drawAIPlayer 严格一致（统一取自 aiSlotCenter）：电脑A 顶部左、电脑B 顶部中、
-     *  电脑C 顶部右，顶 y=100f；面板固定 320x130；牌背宽随 uiScale(aiBackW/aiBackH) 变化，故框也随之缩放。 */
+     *  坐标与 drawAIPlayer 严格一致（统一取自 aiSlotCenter）：电脑A 顶部右、电脑B 顶部中、
+     *  电脑C 顶部左，顶 y=100f；面板固定 320x130；牌背宽随 uiScale(aiBackW/aiBackH) 变化，故框也随之缩放。 */
     private fun aiInfoBounds(playerIndex: Int): RectF {
         val (centerX, topY) = aiSlotCenter(playerIndex)
         val panelW = aiPanelW
@@ -2311,7 +2319,7 @@ class GameSurfaceView(context: Context) : SurfaceView(context), SurfaceHolder.Ca
                 )
             }
             1 -> {
-                // 顶部左AI（电脑A）高亮：框严格包裹其信息区（随 uiScale 缩放）
+                // 顶部右AI（电脑A）高亮：框严格包裹其信息区（随 uiScale 缩放）
                 val pulseAlpha = ((abs(highlightFrame - 30) / 30.0f) * 120 + 60).toInt()
                 highlightPaint.color = Color.argb(pulseAlpha, 255, 152, 0)
                 highlightPaint.strokeWidth = 6f
@@ -2325,7 +2333,7 @@ class GameSurfaceView(context: Context) : SurfaceView(context), SurfaceHolder.Ca
                 canvas.drawRoundRect(aiInfoBounds(2), 20f, 20f, highlightPaint)
             }
             3 -> {
-                // 顶部右AI（电脑C）高亮：框严格包裹其信息区（随 uiScale 缩放）
+                // 顶部左AI（电脑C）高亮：框严格包裹其信息区（随 uiScale 缩放）
                 val pulseAlpha = ((abs(highlightFrame - 30) / 30.0f) * 120 + 60).toInt()
                 highlightPaint.color = Color.argb(pulseAlpha, 255, 152, 0)
                 highlightPaint.strokeWidth = 6f

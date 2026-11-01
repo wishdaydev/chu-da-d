@@ -1816,16 +1816,31 @@ class GameSurfaceView(context: Context) : SurfaceView(context), SurfaceHolder.Ca
      * 座位索引沿**逆时针**递增（与锄大地通行规则一致）：0 底 → 1 顶部右 → 2 顶部中 →
      * 3 顶部左 → 0。俯视这张桌子时，当前玩家的下一家在他**右手边**。
      * - 你(0)：底部中间 0.50W / 0.59H（偏下，位于按钮区下方、手牌上方）
-     * - 电脑A(1)：顶部右 0.78W / 0.40H
-     * - 电脑B(2)：顶部中 0.50W / 0.36H（略高，正对顶部中上的电脑B面板）
-     * - 电脑C(3)：顶部左 0.22W / 0.40H
+     * - 电脑A(1)：顶部右 0.78W
+     * - 电脑B(2)：顶部中 0.50W
+     * - 电脑C(3)：顶部左 0.22W
+     *
+     * 顶部三家的纵坐标由「比例」与「牌背区下沿」共同决定，取较大者：顶部信息面板与牌背扇形
+     * 的位置是**固定像素**（100 + aiPanelH + 16 + aiBackH），而槽位纵坐标是屏幕比例，
+     * 两者在 1080p 只差 10px（牌沿压住牌背下沿），到 720p 会重叠上百像素。用牌背下沿
+     * 加缩放间隙做下限，既能在 1080p 下移到 0.43H（≈0.43），也保证低分辨率不压牌背。
      * @return Pair(centerX, centerY)
      */
-    private fun tableSlotCenter(slot: Int): Pair<Float, Float> = when (slot) {
-        0 -> (screenWidth * 0.50f) to (screenHeight * 0.59f)   // 你（底部）
-        1 -> (screenWidth * 0.78f) to (screenHeight * 0.40f)   // 电脑A（顶部右）
-        2 -> (screenWidth * 0.50f) to (screenHeight * 0.36f)   // 电脑B（顶部中）
-        else -> (screenWidth * 0.22f) to (screenHeight * 0.40f)// 电脑C（顶部左）
+    private fun tableSlotCenter(slot: Int): Pair<Float, Float> {
+        if (slot == 0) return (screenWidth * 0.50f) to (screenHeight * 0.59f)   // 你（底部）
+        val cx = when (slot) {
+            1 -> screenWidth * 0.78f          // 电脑A（顶部右）
+            2 -> screenWidth * 0.50f          // 电脑B（顶部中）
+            else -> screenWidth * 0.22f       // 电脑C（顶部左）
+        }
+        // 牌背扇形下沿 + 24*uiScale 间隙 + 半个牌高 = 牌顶刚好让开牌背的最低纵坐标
+        val backBottom = 100f + aiPanelH + 16f + aiBackH
+        val minCy = backBottom + 24f * uiScale + tableCardH / 2f
+        val cy = when (slot) {
+            1, 3 -> max(screenHeight * 0.40f, minCy)
+            else -> max(screenHeight * 0.36f, minCy)
+        }
+        return cx to cy
     }
 
     /** 桌面中央展示当前最新一手出牌（4 个槽位，各槽位附近标注出牌者名字） */

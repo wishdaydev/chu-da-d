@@ -63,6 +63,11 @@ class SoundEngine {
         const val RELEASE_WAIT_MS = 400L
         /** 单段音频写入的最长耗时（安全阀：track 卡死时不会永久占住音频线程） */
         const val MAX_WRITE_MS = 5000L
+        /**
+         * 音效基准音量（线性）。1.2 让全部音效比原始合成电平高约 1.6dB。
+         * 单个音效可以在 [Sfx] 里覆盖它（目前只有出牌唰声下调到 0.5）。
+         */
+        const val DEFAULT_GAIN = 1.2
     }
 
     /** 播放路径。选定之后不再反复摇摆，成功就一路用到底。 */
@@ -82,26 +87,25 @@ class SoundEngine {
      * @param fallbackDurMs 降级提示音时长
      * @param minGapMs 同一音效的最小触发间隔（0 = 不去重）。滑动选牌会逐张触发，
      *   不去重的话 13 张会排出 1.4 秒的声音尾巴，手指早就离开了。
-     * @param gain 该音效单独的线性音量（1.0 = 原样）。只给个别「确实偏响」的音效下调，
-     *   不设全局总音量——各音效的相对平衡是调过的，整体动会把已经合适的一起压低。
+     * @param gain 该音效的线性音量，默认 [DEFAULT_GAIN]。基准是统一的，只有明显偏响的
+     *   单个音效才在这里下调，不做全局总音量——整体缩放会把已经合适的音效一起带偏。
      */
     private enum class Sfx(
         val fallbackTone: Int,
         val fallbackDurMs: Int,
         val minGapMs: Long,
-        val gain: Double = 1.0
+        val gain: Double = DEFAULT_GAIN
     ) {
         TAP_SELECT(ToneGenerator.TONE_PROP_ACK, 40, 110),
         TAP_DESELECT(ToneGenerator.TONE_PROP_NACK, 30, 110),
 
         /**
-         * 出牌"唰"声：0.7（≈ -3.1dB）。
+         * 出牌"唰"声：0.5，相对基准 1.2 只有 0.42 倍。
          *
          * 它是全部音效里最响的一个——合成时 `lp * 2.2` 的噪声补偿把峰值顶到接近满幅
-         * （约 -0.5dBFS，比选牌点击高 13dB），几乎没有余量，听感上明显压过其它音效。
-         * 其它音效的响度是合适的，所以只调这一个。
+         * （比选牌点击高 13dB），几乎没有余量，听感上明显压过其它音效，所以单独压下来。
          */
-        CARD_PLAY(ToneGenerator.TONE_PROP_BEEP, 80, 0, gain = 0.7),
+        CARD_PLAY(ToneGenerator.TONE_PROP_BEEP, 80, 0, gain = 0.5),
 
         STRONG_PLAY(ToneGenerator.TONE_CDMA_ABBR_ALERT, 300, 0),
         WIN(ToneGenerator.TONE_CDMA_PIP, 200, 0),
@@ -487,16 +491,20 @@ class SoundEngine {
     // ==================== PCM 合成（仅音频线程调用） ====================
 
     /**
-     * 合成 → 软限幅 → 乘该音效音量 → 16bit。
+     * 合成 → 乘该音效音量 → 软限幅 → 16bit。
+     *
+     * 顺序不能反：音量乘在限幅**之前**。基准增益 1.2 会把峰值抬到 1.1 以上，若先限幅
+     * 再乘，等于限完又重新溢出，掉进 `coerceIn` 硬切——削波又回来了。
      *
      * 限幅放在这里而不是每个 synth 内部：合成阶段可以放心叠加多层（叠加本身就会
      * 超过 1.0，中途防溢出只能靠硬削），电平问题统一在出口处理一次。
      */
     private fun pcmFor(key: Sfx): ShortArray = pcmCache.getOrPut(key) {
         val d = synth(key)
+        for (i in d.indices) d[i] *= key.gain
         softLimit(d)
         ShortArray(d.size) { i ->
-            (d[i] * key.gain * 32767.0).coerceIn(-32767.0, 32767.0).toInt().toShort()
+            (d[i] * 32767.0).coerceIn(-32767.0, 32767.0).toInt().toShort()
         }
     }
 

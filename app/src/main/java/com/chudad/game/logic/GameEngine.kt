@@ -114,6 +114,8 @@ class GameEngine {
     private val HINT_DEADLINE_MS = 300L
     /** 提示（getHint）同步搜索节点预算 */
     private val HINT_NODE_LIMIT = 450_000
+    /** 2 的点数（全场最大牌；提示里不拿它去压小牌） */
+    private val RANK_TWO = 15
 
     // ============================ 开局 / 结束 ============================
 
@@ -700,7 +702,9 @@ class GameEngine {
         val hand = players[0].handCards
         val lastPlay = stateMachine.lastPlayedGroup
 
-        val decision = if (aiDifficulty == Difficulty.MASTER && playerHintStrategy == Difficulty.MASTER) {
+        val useMasterSolver =
+            aiDifficulty == Difficulty.MASTER && playerHintStrategy == Difficulty.MASTER
+        val decision = if (useMasterSolver) {
             MasterAIDecision.decide(
                 buildMasterSnapshot(0),
                 deadlineMs = HINT_DEADLINE_MS,
@@ -729,10 +733,14 @@ class GameEngine {
             if (max != null) return listOf(max)
         }
 
-        if (decision != null && decision.type != CardType.INVALID) return decision.cards
+        if (decision != null && decision.type != CardType.INVALID) {
+            // 大师搜索的结果有完整算路支撑，原样给出；启发式只看局面打分，会给出拆牌组的选择，
+            // 交给 [preferUnbrokenPlay] 在同张数候选里换成不拆结构的那一手。
+            return if (useMasterSolver) decision.cards else preferUnbrokenPlay(hand, decision, lastPlay)
+        }
 
         // 兜底：策略判定「过牌 / 无解」时，只要手中仍有合法走法，就提示「最小可打的牌型」——
-        // 需要时拆散对子/三条、甚至动用 2 也在所不惜，避免明明能出却提示「没有能出的牌」。
+        // 实在没有现成散牌可用时，才拆散对子/三条、甚至动用 2，避免明明能出却提示「没有能出的牌」。
         // 仅当确实一手都出不了（findAllValidPlays 为空）才返回 null。
         val legal = CardRuleEngine.findAllValidPlays(hand, lastPlay)
         if (legal.isEmpty()) return null
@@ -743,10 +751,68 @@ class GameEngine {
                 .maxByOrNull { it.mainRank * 16 + it.topSuitOrder }
             if (maxSingle != null) return maxSingle.cards
         }
-        // 否则取「最小可打」：主体点数最小、其次花色最小（同张数/同型内比较）
+        // 否则取「不拆牌组的最小可打」：先保证不拆散现成的对子/三条，其次主体点数最小、花色最小。
+        //
+        // 旧实现只按点数排序，于是「手上 对6 + 散A，桌面单5」会提示拆对 6 —— 明明有 A 可以整张出去，
+        // 却把对子拆成两张散牌。散牌优先、拆组垫底，才是提示该有的口径。
+        val handRankCounts = hand.groupingBy { it.rank }.eachCount()
         val pick = legal.minWithOrNull(
-            compareBy<CardGroup> { it.mainRank }.thenBy { it.topSuitOrder }
+            compareBy<CardGroup> { breakCost(it, handRankCounts) }
+                .thenBy { it.mainRank }
+                .thenBy { it.topSuitOrder }
         )
         return pick?.cards
+    }
+
+    /**
+     * 出 [g] 会「拆散」几个天然牌组（对子 / 三条 / 四条）。
+     *
+     * 判定口径：某点数出牌前 >= 2 张、出完后只剩 1 张 —— 原本成对/成条的牌被打散成孤张，
+     * 之后只能当散牌走或等别人配牌。整组出完（剩 0 张）、或本来就只有 1 张（散牌）都不计。
+     * 例：手上 6,6,6 出 1 张剩 2 → 三条降为对子，结构还在，不计；出 2 张剩 1 → 计 1。
+     *
+     * 只统计同点数结构，不评估顺子/同花这类跨点数牌型：同样 5 张牌该不该留取决于整手走向，
+     * 属于策略判断（交给 [AIDecision] / 大师搜索）。这里只保证「有现成散牌就不拆对子」。
+     */
+    private fun breakCost(g: CardGroup, handRankCounts: Map<Int, Int>): Int {
+        var cost = 0
+        for ((rank, cards) in g.cards.groupBy { it.rank }) {
+            val total = handRankCounts[rank] ?: 0
+            if (total >= 2 && total - cards.size == 1) cost++
+        }
+        return cost
+    }
+
+    /**
+     * 启发式给出的 [decision] 若拆散了现成牌组，而同样张数的合法候选里存在「不拆组」的选择，
+     * 则改用其中最小的一手。
+     *
+     * 触发场景：手上 对6 + 散A、桌面单 5。旧启发式的单价是「主牌点数 ×2」、拆组只罚 6 分，
+     * 出 6（12 + 拆组 6 + 剩余两手 20 = 38）与出 A（28 + 0 + 剩余一手 10 = 38）恰好打平，
+     * `minBy` 取到了先出现的 6 —— 明明 A 可以整张出去，却把对子拆成两张散牌。
+     *
+     * [AIDecision] 侧的拆组单价已同步提到 18，正常情况下不会再给出拆组选择；这里是提示层的
+     * 最后一道闸：AI 的权重将来若回调或换算法，提示仍不会教玩家无故拆对子。代价是仅在
+     * `decision` 确实拆组时才多算一次候选（十几张牌，毫秒级）。
+     *
+     * 排除 2：它是全场最大的牌，拿去压小牌是纯亏，这种情况保留原决策（拆小对子更划算）。
+     * 找不到替代时原样返回，所以不会出现「提示无牌可出」。
+     */
+    private fun preferUnbrokenPlay(
+        hand: List<Card>,
+        decision: CardGroup,
+        lastPlay: CardGroup?
+    ): List<Card> {
+        val counts = hand.groupingBy { it.rank }.eachCount()
+        if (breakCost(decision, counts) == 0) return decision.cards
+
+        val alt = CardRuleEngine.findAllValidPlays(hand, lastPlay)
+            .filter {
+                it.cards.size == decision.cards.size &&
+                        it.mainRank != RANK_TWO &&
+                        breakCost(it, counts) == 0
+            }
+            .minWithOrNull(compareBy<CardGroup> { it.mainRank }.thenBy { it.topSuitOrder })
+        return alt?.cards ?: decision.cards
     }
 }

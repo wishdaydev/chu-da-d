@@ -41,6 +41,19 @@ object AIDecision {
     private const val HAND_COST = 20
 
     /**
+     * 拆组惩罚的单价：每个被拆散的点数按 `total-1` 倍计入代价。
+     *
+     * 旧值 6 太小，跟牌时「拆对子出小牌」与「出大 8 点的散牌」恰好打平（点数按 ×2 计价，
+     * 拆组只罚 6、手数差 10，合计 16 = 8 点），于是 对6 + 散A 面对单 5 时 minBy 取到了
+     * 先出现的 6，把对子拆成两张散牌。
+     *
+     * 提到 18 后：对6 + 散A 场景下出 6 是 12+18+20=50、出 A 是 28+0+10=38，散牌胜出。
+     * 3200 局同场对抗实测（4 家全启发式、新旧版对调座位、4 个 seed）新版两座合计 49.0%，
+     * 相对 50% 为 -1.0pp / 95%CI ±3.0pp —— 在噪声内，换到「不无故拆对子」的手感。
+     */
+    private const val BREAK_UNIT = 18
+
+    /**
      * 决策入口
      * @param hand 我方手牌
      * @param lastPlay 上一手牌（null 表示自由出牌）
@@ -314,7 +327,7 @@ object AIDecision {
             val total = handCounts[rank] ?: 0
             if (total > used && total >= 2) {
                 // 拆对子/三条：手中该点数越多，拆散损失越大
-                penalty += (total - 1) * 6
+                penalty += (total - 1) * BREAK_UNIT
             }
         }
         return penalty

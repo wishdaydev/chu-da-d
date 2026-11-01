@@ -637,11 +637,10 @@ internal object MasterSearch {
         }
         val unseen = IntArray(16)
         for (r in 3..15) unseen[r] = 4 - own[r] - playedCnt[r]
-        var k = 0
-        for (i in 0..3) {
-            if (i == player) continue
-            oppCounts[k++] = state.hands[i].size
-        }
+        // 顺序必须与出牌顺序一致：[0] 恒为下家（AIDecision 用 [0] 判断「下家报单」，
+        // freeLead 也拿它当 nextCards）。按座位号升序填（0,1,2,3 去掉自己）在 player=1/2 时
+        // 会把上家当成下家，下家保护就落到了错误的人身上。
+        for (i in 1..3) oppCounts[i - 1] = state.hands[(player + i) % 4].size
         val decision = forcedTopBig ?: run {
             val d = AIDecision.decide(
                 hand = hand,

@@ -57,7 +57,9 @@ object AIDecision {
      * 决策入口
      * @param hand 我方手牌
      * @param lastPlay 上一手牌（null 表示自由出牌）
-     * @param opponentCardCounts 其余 3 家的手牌数
+     * @param opponentCardCounts 其余 3 家的手牌数，**下标 0 固定为下家**，即按出牌顺序
+     *        `(myIndex+1) % 4`、`(myIndex+2) % 4`、`(myIndex+3) % 4` 排列（不是座位号升序，
+     *        也不是屏幕方位）。[follow] 用 [0] 判断「下家报单」，[freeLead] 用 [0] 当 nextCards。
      * @param unseenCounts 我方未见各点数剩余张数（下标即 rank）
      * @param requireDiamond3 本手是否必须包含方块 3（整场第一局首手）
      * @param mustTopBig 下家是否已报单（顶大义务：出单张须为手中最大）

@@ -92,11 +92,12 @@ object MasterAIDecision {
         }
 
         // 回退：普通模式启发式
-        val opponentCardCounts = snapshot.hands
-            .filterKeys { it != snapshot.myIndex }
-            .values
-            .map { it.size }
-            .toIntArray()
+        // 对手张数必须与 [com.chudad.game.logic.GameEngine.getOpponentCardCounts] 同口径：
+        // [0] 恒为下家。Map 的 values 是座位号升序，直接塞给 AIDecision 会在 myIndex=1/2 时
+        // 把上家当成「下家报单」的保护对象。
+        val opponentCardCounts = IntArray(3) { i ->
+            snapshot.hands[(snapshot.myIndex + i + 1) % 4]?.size ?: 13
+        }
         val unseenCounts = IntArray(16)
         snapshot.hands
             .filterKeys { it != snapshot.myIndex }

@@ -1820,10 +1820,14 @@ class GameSurfaceView(context: Context) : SurfaceView(context), SurfaceHolder.Ca
      * - 电脑B(2)：顶部中 0.50W
      * - 电脑C(3)：顶部左 0.22W
      *
-     * 顶部三家的纵坐标由「比例」与「牌背区下沿」共同决定，取较大者：顶部信息面板与牌背扇形
-     * 的位置是**固定像素**（100 + aiPanelH + 16 + aiBackH），而槽位纵坐标是屏幕比例，
-     * 两者在 1080p 只差 10px（牌沿压住牌背下沿），到 720p 会重叠上百像素。用牌背下沿
-     * 加缩放间隙做下限，既能在 1080p 下移到 0.43H（≈0.43），也保证低分辨率不压牌背。
+     * 顶部三家的纵坐标由「比例」与上下限共同决定：顶部信息面板与牌背扇形的位置是**固定像素**
+     * （100 + aiPanelH + 16 + aiBackH），出牌按钮的 y 也是固定像素（screenHeight - cardH - 380），
+     * 而槽位纵坐标是屏幕比例，两者在 1080p 只差 10px，到 720p 会差上百像素。
+     * - 左右两槽：用「牌背下沿 + 缩放间隙 + 半个牌高」做下限，1080p 下自然落到 0.43H，低分辨率也不压牌背。
+     * - 中间槽（电脑B）：刻意保留更靠上的位置——顶部三家齐平显得很「排排坐」，中间略高、
+     *   牌沿压住牌背反而有层次，牌背被遮无所谓。它只受两条约束：牌顶不压信息面板、
+     *   **牌底不伸进玩家按钮区**（轮到玩家时，桌上可能还留着电脑B 刚出的牌，招牌盖住按钮最难看）。
+     *   因此 1080p 下取 0.36H 与按钮顶之间的较大安全值，1440p 仍是 0.36H。
      * @return Pair(centerX, centerY)
      */
     private fun tableSlotCenter(slot: Int): Pair<Float, Float> {
@@ -1836,9 +1840,17 @@ class GameSurfaceView(context: Context) : SurfaceView(context), SurfaceHolder.Ca
         // 牌背扇形下沿 + 24*uiScale 间隙 + 半个牌高 = 牌顶刚好让开牌背的最低纵坐标
         val backBottom = 100f + aiPanelH + 16f + aiBackH
         val minCy = backBottom + 24f * uiScale + tableCardH / 2f
+        // 中间槽：牌顶不压信息面板（面板底 + 8*uiScale），牌底不伸进按钮区（按钮顶 - 12*uiScale）
+        val panelMinCy = 100f + aiPanelH + 8f * uiScale + tableCardH / 2f
+        val btnTopCy = screenHeight - cardH - 380f - 12f * uiScale - tableCardH / 2f
         val cy = when (slot) {
             1, 3 -> max(screenHeight * 0.40f, minCy)
-            else -> max(screenHeight * 0.36f, minCy)
+            else -> {
+                val pref = screenHeight * 0.36f
+                // 屏幕过矮（按钮顶已高过面板底）时以「不压面板」优先，否则夹在两者之间
+                if (btnTopCy > panelMinCy) pref.coerceIn(panelMinCy, btnTopCy)
+                else max(pref, panelMinCy)
+            }
         }
         return cx to cy
     }

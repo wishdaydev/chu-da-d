@@ -32,15 +32,21 @@ import java.util.concurrent.atomic.AtomicLong
  *   HUMAN_MODEL_WEIGHT = 建模强度（默认 0.0）。1=完全信任（人类节点仅 AIDecision 单手），
  *                        0~1=软建模（按权重补充弱人类候选），<=0=不建模（其余 3 座退化为全量展开做对照）。
  *   HEURISTIC_SEATS    = 哪些座位用启发式（默认：仅 HUMAN_MODEL_SEAT 指定的那一个）
- *   SELFISH_SEATS      = 哪些座位用 selfish 对手模型（默认全部；线上即为全部）
+ *   OPP_MODEL          = selfish（默认，线上同档）| paranoid（三家联盟 MIN，旧行为）
+ *   SELFISH_SEATS      = 哪些座位用 selfish 对手模型（默认全部；设空集即全部退回 paranoid）
  *   OPP_TOPK           = 对手模型保留候选数（默认 2）
  *   MAX_DEPTH          = 迭代深度上限（默认「自动」：按剩余牌数推导，等同线上；压到 8~12 可做浅搜索对照）
+ *
+ * A/B 对照开关（同场对抗用，详见 sim/README.md 第六节）：
+ *   LEGACY_SEATS       = 这些座位跑 sim/AIDecisionV0.kt 旧版启发式
+ *   LEGACY_EVAL_SEATS  = 这些座位用旧评估（不做对手报单终局化）
+ *   NODE_LIMIT_SEATS   = 按座位覆盖节点预算，如 "0:10000"
  *
  * 典型用法：
  *   全大师基线:            HUMAN_MODEL_SEAT=-1
  *   对照(人类代理+不建模):  HUMAN_MODEL_SEAT=0 HUMAN_MODEL_WEIGHT=0
  *   线上配置(w=0.8):        HUMAN_MODEL_SEAT=0 HUMAN_MODEL_WEIGHT=0.8
- *   3 大师 vs 1 启发式:     HEURISTIC_SEATS=0 SELFISH_SEATS=1,2,3
+ *   3 大师 vs 1 启发式:     HEURISTIC_SEATS=0
  */
 /** id → rank 查表（从已出牌集合反推点数，供人类代理构造有限信息 unseenCounts） */
 private val ID_TO_RANK_SIM = createDeck().associate { it.id to it.rank }

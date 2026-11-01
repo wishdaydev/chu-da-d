@@ -13,8 +13,10 @@ import java.util.concurrent.RejectedExecutionException
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicInteger
 import kotlin.math.PI
+import kotlin.math.abs
 import kotlin.math.exp
 import kotlin.math.sin
+import kotlin.math.tanh
 import kotlin.random.Random
 
 /**
@@ -80,11 +82,27 @@ class SoundEngine {
      * @param fallbackDurMs 降级提示音时长
      * @param minGapMs 同一音效的最小触发间隔（0 = 不去重）。滑动选牌会逐张触发，
      *   不去重的话 13 张会排出 1.4 秒的声音尾巴，手指早就离开了。
+     * @param gain 该音效单独的线性音量（1.0 = 原样）。只给个别「确实偏响」的音效下调，
+     *   不设全局总音量——各音效的相对平衡是调过的，整体动会把已经合适的一起压低。
      */
-    private enum class Sfx(val fallbackTone: Int, val fallbackDurMs: Int, val minGapMs: Long) {
+    private enum class Sfx(
+        val fallbackTone: Int,
+        val fallbackDurMs: Int,
+        val minGapMs: Long,
+        val gain: Double = 1.0
+    ) {
         TAP_SELECT(ToneGenerator.TONE_PROP_ACK, 40, 110),
         TAP_DESELECT(ToneGenerator.TONE_PROP_NACK, 30, 110),
-        CARD_PLAY(ToneGenerator.TONE_PROP_BEEP, 80, 0),
+
+        /**
+         * 出牌"唰"声：0.7（≈ -3.1dB）。
+         *
+         * 它是全部音效里最响的一个——合成时 `lp * 2.2` 的噪声补偿把峰值顶到接近满幅
+         * （约 -0.5dBFS，比选牌点击高 13dB），几乎没有余量，听感上明显压过其它音效。
+         * 其它音效的响度是合适的，所以只调这一个。
+         */
+        CARD_PLAY(ToneGenerator.TONE_PROP_BEEP, 80, 0, gain = 0.7),
+
         STRONG_PLAY(ToneGenerator.TONE_CDMA_ABBR_ALERT, 300, 0),
         WIN(ToneGenerator.TONE_CDMA_PIP, 200, 0),
         LOSE(ToneGenerator.TONE_PROP_NACK, 200, 0),
@@ -468,10 +486,17 @@ class SoundEngine {
 
     // ==================== PCM 合成（仅音频线程调用） ====================
 
+    /**
+     * 合成 → 软限幅 → 乘该音效音量 → 16bit。
+     *
+     * 限幅放在这里而不是每个 synth 内部：合成阶段可以放心叠加多层（叠加本身就会
+     * 超过 1.0，中途防溢出只能靠硬削），电平问题统一在出口处理一次。
+     */
     private fun pcmFor(key: Sfx): ShortArray = pcmCache.getOrPut(key) {
         val d = synth(key)
+        softLimit(d)
         ShortArray(d.size) { i ->
-            (d[i] * 32767.0).coerceIn(-32767.0, 32767.0).toInt().toShort()
+            (d[i] * key.gain * 32767.0).coerceIn(-32767.0, 32767.0).toInt().toShort()
         }
     }
 
@@ -592,15 +617,45 @@ class SoundEngine {
     private fun offset(a: DoubleArray, skip: Int): DoubleArray =
         if (skip <= 0) a else if (skip >= a.size) DoubleArray(0) else a.copyOfRange(skip, a.size)
 
+    /** 多轨并集叠加（给 WIN 的尾音和声用）。同样不做中途限幅，交给出口 [softLimit] */
     private fun mix(parts: List<DoubleArray>): DoubleArray {
         val len = parts.maxOf { it.size }
         val out = DoubleArray(len)
         for (p in parts) for (i in p.indices) out[i] += p[i]
-        return out.map { it.coerceIn(-1.0, 1.0) }.toDoubleArray()
+        return out
     }
 
+    /**
+     * 混音叠加：直接相加，**不在中途防溢出**。
+     *
+     * 旧实现每加一层就 `coerceIn(-1.0, 1.0)`。STRONG_PLAY 三层叠加的峰值是 1.52
+     * （+3.6dBFS），第三层一叠上前几十毫秒就被切平——平顶沿等价于方波，带来大量
+     * 奇次谐波，听感是"炸"而不是"响"。电平问题交给出口的 [softLimit] 处理。
+     */
     private fun addInto(dst: DoubleArray, src: DoubleArray) {
         val n = minOf(dst.size, src.size)
-        for (i in 0 until n) dst[i] = (dst[i] + src[i]).coerceIn(-1.0, 1.0)
+        for (i in 0 until n) dst[i] += src[i]
+    }
+
+    /**
+     * 软限幅：峰值超过 [limit] 时用 tanh 曲线平滑压回，而不是切平。
+     *
+     * 与"整体线性缩放"的区别在于只压峰、不动中小电平——爆炸声的冲击力主要来自
+     * 前 50ms 的过冲，线性缩放会把它连同尾音一起压掉（实测 RMS -14.7 → -18.7dBFS，
+     * 明显变轻）；tanh 饱和则把过冲压扁、把小信号近似线性保留（RMS 反而到 -14.1，
+     * 听感更厚实）。
+     *
+     * [drive] 越大压得越狠、谐波越多。取 2.0：峰值 -0.5dBFS、无平顶样本，
+     * 谐波落在低频段，是"厚重"而非"破音"。
+     */
+    private fun softLimit(buf: DoubleArray, limit: Double = 0.94, drive: Double = 2.0) {
+        var peak = 0.0
+        for (v in buf) {
+            val a = abs(v)
+            if (a > peak) peak = a
+        }
+        if (peak <= limit || peak == 0.0) return
+        val norm = limit / tanh(drive)
+        for (i in buf.indices) buf[i] = norm * tanh(drive * buf[i] / peak)
     }
 }

@@ -11,6 +11,7 @@ import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
 import java.util.concurrent.RejectedExecutionException
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicInteger
 import kotlin.math.PI
 import kotlin.math.exp
 import kotlin.math.sin
@@ -22,20 +23,26 @@ import kotlin.random.Random
  * 相比直接使用 ToneGenerator 的电信令音，合成音更圆润细腻（柔和起音、泛音层次、
  * 低频"厚度"），且全部在后台线程生成与写入，不阻塞绘制/触摸线程。
  *
- * 播放链路有四条硬约束，都是 2026-11 重写时才补上的（旧实现违反后会导致"永久嘟嘟声"）：
+ * ## 路径选择：探测一次就锁定
  *
- *  1. **AudioTrack 延迟创建、失败可重试**。旧实现在构造函数里判定一次 `useAudioTrack`，
- *     失败即整个引擎生命周期降级为提示音，且异常被 `catch (_: Exception) {}` 吞掉。
- *     结果是「一次构造失败 = 这一整局都是嘟嘟声」，线上还查不到原因。
- *  2. **失败必须留痕**。所有失败路径都打一行 Log（TAG = ChuDaD-Audio），包含 state /
- *     buffer / 异常类型，便于用 logcat 定位。
- *  3. **释放前必须等在飞的任务结束，且先 pause+flush 再 release**。旧实现 `shutdown()`
- *     之后立刻 `track.release()`，而此时音频线程可能正阻塞在 `write()` 里，两个线程同时
- *     操作同一个 AudioTrack —— 这是明确的数据竞争，会让 AudioFlinger 侧的 track 泄漏，
- *     逐次累积后耗尽每个 uid 的 track 配额，此后**所有**新建 AudioTrack 都返回
- *     STATE_UNINITIALIZED，永久嘟嘟。
- *  4. **写入用非阻塞 + 代次检查**。新音效可以立刻顶掉还在播的旧音效（不排队成一条长尾），
- *     也不会因为 `write()` 永久阻塞而卡住 `release()`。
+ * AudioTrack 在正常设备上创建成功率接近 100%，失败几乎总有确定原因（缓冲参数不合法、
+ * 音频服务不可用、track 配额耗尽）。参数类错误重试一千次也一样失败，所以这里**不做
+ * 定时冷却重试**，只用三态机：[Path.UNKNOWN] → 首次播放时探测 → 成功锁 [Path.TRACK]；
+ * 连续失败 [CREATE_ATTEMPTS] 次则封存为 [Path.FALLBACK]，此后不再有任何创建开销。
+ *
+ * 唯一的「重建」场景是 track 被系统回收（切后台后 `state` 变 `STATE_UNINITIALIZED`），
+ * 那是对象失效而非探测失败，必须重建才能出声。
+ *
+ * ## 另外三条硬约束（旧实现违反后会导致"永久嘟嘟声"）
+ *
+ *  1. **失败必须留痕**：所有失败路径都打一行 Log（TAG = ChuDaD-Audio），含 state /
+ *     minBuf / buffer / 异常类型。旧实现 `catch (_: Exception) {}` 全吞，线上无从定位。
+ *  2. **释放前必须等在飞任务结束，且先 pause+flush 再 release**：旧实现 `shutdown()`
+ *     后立刻 `release()`，音频线程可能正阻塞在 `write()` 里，两线程同时操作同一
+ *     AudioTrack —— 数据竞争会让 AudioFlinger 侧 track 泄漏，累积耗尽每 uid 配额，
+ *     此后所有新建都返回 STATE_UNINITIALIZED，永久嘟嘟。
+ *  3. **写入用非阻塞 + 代次检查**：新音效可立刻顶掉还在播的旧音效（不排队成长尾），
+ *     也不会因 `write()` 永久阻塞而卡住 `release()`。
  *
  * 降级策略：AudioTrack 不可用时退回 ToneGenerator 提示音——宁可音色差，也不要没声音。
  */
@@ -44,16 +51,26 @@ class SoundEngine {
     private companion object {
         const val TAG = "ChuDaD-Audio"
         const val SAMPLE_RATE = 44100
-        /** 新建 AudioTrack 失败后的重试冷却：太短会每声都撞一次失败，太长则恢复慢 */
-        const val TRACK_RETRY_MS = 3000L
-        /** 写入失败（track 已死）后的重建冷却：这种情况多半是新 track 能立刻建起来，不必等 3 秒 */
-        const val WRITE_FAIL_RETRY_MS = 500L
+        /** 单声道 16bit：每帧 2 字节。缓冲大小必须按帧对齐，否则可能被系统拒收 */
+        const val FRAME_BYTES = 2
+        /** 创建 AudioTrack 的最大连续失败次数：达到即封存为提示音，本次运行不再尝试 */
+        const val CREATE_ATTEMPTS = 3
         /** 非阻塞写入的轮询间隔，同时决定「新音效顶掉旧音效」的响应粒度 */
         const val WRITE_POLL_MS = 4L
         /** 释放时等待音频线程退出的上限 */
         const val RELEASE_WAIT_MS = 400L
         /** 单段音频写入的最长耗时（安全阀：track 卡死时不会永久占住音频线程） */
         const val MAX_WRITE_MS = 5000L
+    }
+
+    /** 播放路径。选定之后不再反复摇摆，成功就一路用到底。 */
+    private enum class Path {
+        /** 尚未探测：首次播放时才知道这台设备能否用合成音 */
+        UNKNOWN,
+        /** 已锁定合成音（track 被系统回收时重建，仍属这条路径，不重新探测） */
+        TRACK,
+        /** 已封存为提示音：创建连续失败 [CREATE_ATTEMPTS] 次，本次运行不再尝试 */
+        FALLBACK
     }
 
     /**
@@ -86,13 +103,23 @@ class SoundEngine {
     /**
      * 播放代次：每发起一个新音效自增。音频线程在写入循环里比对它，
      * 一旦发现被更新的音效取代就立刻退出，实现「后来者优先」。
+     *
+     * 用 AtomicInteger 而非 `@Volatile var` + `++`：音效既可能由 UI 线程触发（触摸），
+     * 也可能由引擎回调线程触发（出牌）。`++` 是「读-改-写」，两个线程并发时会拿到
+     * 同一个代次，导致「后来者优先」失效、两个音效串着播。
      */
-    @Volatile private var generation = 0
+    private val generation = AtomicInteger(0)
 
-    /** 下次允许尝试新建 AudioTrack 的时刻（uptimeMillis）；0 = 随时可以 */
-    @Volatile private var nextCreateAllowedMs = 0L
+    /** 当前播放路径。音频线程写、其它线程读，故 volatile */
+    @Volatile private var path = Path.UNKNOWN
+
+    /** 连续创建失败次数，成功即清零（仅在 lock 内访问） */
+    private var createFailures = 0
 
     private var toneGenerator: ToneGenerator? = null
+
+    /** ToneGenerator 创建失败后置位：不再重复尝试，避免每一声都撞一次失败（仅 lock 内访问） */
+    private var toneFailed = false
 
     /** PCM 缓存：合成一次反复用（仅音频线程访问，无需加锁） */
     private val pcmCache = HashMap<Sfx, ShortArray>()
@@ -107,7 +134,8 @@ class SoundEngine {
 
     init {
         // 预热最常见的两个音效，避免第一次出牌时才在音频线程上做合成。
-        // 注意：这里**不**创建 AudioTrack —— 创建推迟到首次播放，失败还能在下次重试。
+        // 这里**不**创建 AudioTrack：推迟到首次播放，避免在 View 构造（主线程、
+        // 进程刚起）时跟系统抢音频服务，那时恰恰是最容易失败的时机。
         submit {
             pcmFor(Sfx.CARD_PLAY)
             pcmFor(Sfx.TAP_SELECT)
@@ -150,8 +178,7 @@ class SoundEngine {
         val now = SystemClock.uptimeMillis()
         if (key.minGapMs > 0 && now - lastPlayMs[key.ordinal] < key.minGapMs) return
         lastPlayMs[key.ordinal] = now
-        generation++
-        val gen = generation
+        val gen = generation.incrementAndGet()
         submit { playNow(key, gen) }
     }
 
@@ -163,39 +190,52 @@ class SoundEngine {
         }
     }
 
-    /** 音频线程：优先合成路径，AudioTrack 不可用或写入失败则降级为提示音 */
+    /** 音频线程：已封存为提示音就直接走提示音，否则先试合成路径 */
     private fun playNow(key: Sfx, gen: Int) {
         if (released) return
-        val t = obtainTrack()
-        if (t != null) {
-            if (writeAll(t, pcmFor(key), gen)) return
-            dropTrack("写入失败：${key.name}")
+        if (path != Path.FALLBACK) {
+            val t = obtainTrack()
+            if (t != null) {
+                if (writeAll(t, pcmFor(key), gen)) return
+                // 写入失败：track 多半已死，丢弃后由下一次播放重建。本声改用提示音，
+                // 保证「这一手出牌一定有声音」而不是静默。
+                discardTrack("写入失败：${key.name}")
+            }
         }
         playFallback(key)
     }
 
     /**
-     * 取一个可用的 AudioTrack：有就复用，没有就新建，建失败则进入 3 秒冷却。
+     * 取一个可用的 AudioTrack：有就复用，被系统回收就重建，从未建成过才探测。
      *
-     * 这是「失败可恢复」的核心——旧实现只在构造时试一次，失败即永久降级。
-     * 典型的可恢复场景：回前台的瞬间系统音频服务正忙、被其它 App 占满，几百毫秒后就正常了。
+     * 探测只在 [Path.UNKNOWN] 发生；锁定 [Path.TRACK] 后只做「失效重建」，不重复探测。
+     * 连续 [CREATE_ATTEMPTS] 次创建失败即封存为 [Path.FALLBACK]，之后直接走提示音，
+     * 不再有任何创建开销——参数类错误重试无意义，只会让每一声都多一次失败调用。
      */
     private fun obtainTrack(): AudioTrack? {
+        // 系统回收过的 track 必须重建：state 变 UNINITIALIZED 是「对象失效」，不是探测失败
         track?.let { t ->
             if (t.state == AudioTrack.STATE_INITIALIZED) return t
-            discardTrack("state 已失效")   // 这种失效与资源无关，不冷却，立刻重建
+            discardTrack("state 已失效")
         }
-        if (SystemClock.uptimeMillis() < nextCreateAllowedMs) return null
         synchronized(lock) {
-            if (released) return null
-            track?.let { return it }
+            if (released || path == Path.FALLBACK) return null
+            // 走到这里 track 必为 null：上面的失效检查已 discard，且只有音频线程写 track
             val created = createTrack()
             if (created == null) {
-                nextCreateAllowedMs = SystemClock.uptimeMillis() + TRACK_RETRY_MS
+                createFailures++
+                if (createFailures >= CREATE_ATTEMPTS) {
+                    path = Path.FALLBACK
+                    Log.w(TAG, "连续 $createFailures 次创建失败，本次运行永久改用提示音")
+                }
                 return null
             }
+            createFailures = 0
             track = created
-            nextCreateAllowedMs = 0
+            if (path != Path.TRACK) {
+                path = Path.TRACK
+                Log.i(TAG, "音频路径锁定：AudioTrack 合成音")
+            }
             return created
         }
     }
@@ -215,11 +255,14 @@ class SoundEngine {
             val minBuf = AudioTrack.getMinBufferSize(
                 SAMPLE_RATE, AudioFormat.CHANNEL_OUT_MONO, AudioFormat.ENCODING_PCM_16BIT
             )
-            // getMinBufferSize 返回的是「字节」。旧实现写成 coerceAtLeast(sampleRate / 4)，
-            // 即 11025 字节 = 5512 采样 ≈ 125ms —— 把缓冲下限抬到了 125ms，每声都慢半拍。
-            // 这里改用 2 倍最小缓冲（通常 40~80ms）：足够防 underrun，又不拖延迟。
-            val base = if (minBuf > 0) minBuf else SAMPLE_RATE / 25 * 2   // 兜底 40ms
-            val bufBytes = (base * 2).coerceAtLeast(4096)
+            // getMinBufferSize 返回「字节」，出错时返回负的错误码。
+            // 取 2 倍最小缓冲（通常 40~80ms）：足够防 underrun，又不拖长延迟。
+            // 旧实现是 coerceAtLeast(sampleRate / 4) = 11025 字节 = 5512.5 帧 ≈ 125ms，
+            // 既把延迟下限抬到 125ms，又因为有半帧余量而可能被系统拒收——这是「几乎每次
+            // 都嘟嘟声」最可能的直接原因。这里改为「兜底值 + 按帧对齐」，不再出现奇数字节。
+            val base = if (minBuf > 0) minBuf else SAMPLE_RATE / 25 * FRAME_BYTES   // 兜底 40ms
+            val bufBytes = ((base * 2) / FRAME_BYTES * FRAME_BYTES)
+                .coerceAtLeast(FRAME_BYTES * 1024)   // 至少 1024 帧 ≈ 23ms
             val t = AudioTrack(
                 attrs, fmt, bufBytes, AudioTrack.MODE_STREAM, AudioManager.AUDIO_SESSION_ID_GENERATE
             )
@@ -234,12 +277,6 @@ class SoundEngine {
             Log.w(TAG, "AudioTrack 创建失败，降级为提示音：${e.javaClass.simpleName}: ${e.message}")
             return null
         }
-    }
-
-    /** 写入失败后丢弃 track，短暂冷却后重建（避免「每声都新建一次、每声都失败」的空转） */
-    private fun dropTrack(reason: String) {
-        discardTrack(reason)
-        nextCreateAllowedMs = SystemClock.uptimeMillis() + WRITE_FAIL_RETRY_MS
     }
 
     /** 丢弃 track 实例（暂停 → 清缓冲 → 释放，三步顺序不能反） */
@@ -269,7 +306,7 @@ class SoundEngine {
             while (off < buf.size) {
                 // 被更新的音效取代：补一段淡出再退出。直接 return 会让波形从中间断掉，
                 // 听感上是一声「啪」的爆音；淡出 12ms 后自然收尾。
-                if (released || gen != generation) {
+                if (released || gen != generation.get()) {
                     if (off > 0) fadeOut(t, buf, off)
                     return true
                 }
@@ -330,17 +367,23 @@ class SoundEngine {
         }
     }
 
-    /** ToneGenerator 兜底（音色是电信令音，但保证「有声音」而不是静默） */
+    /**
+     * ToneGenerator 兜底（音色是电信令音，但保证「有声音」而不是静默）。
+     *
+     * 创建失败一次就不再尝试：[toneFailed] 置位后每一声直接返回。否则设备完全无音频
+     * 时，每一次出牌都会重撞一次创建失败并打一条日志，logcat 会被刷满，且没有任何意义。
+     */
     private fun playFallback(key: Sfx) {
         val tg = synchronized(lock) {
-            if (released) return
+            if (released || toneFailed) return
             toneGenerator ?: try {
                 ToneGenerator(AudioManager.STREAM_MUSIC, 100).also {
                     toneGenerator = it
                     Log.i(TAG, "已启用提示音兜底")
                 }
             } catch (e: Exception) {
-                Log.w(TAG, "ToneGenerator 创建失败（完全静音）：${e.javaClass.simpleName}: ${e.message}")
+                toneFailed = true
+                Log.w(TAG, "ToneGenerator 创建失败（完全静音，后续不再尝试）：${e.javaClass.simpleName}: ${e.message}")
                 null
             }
         } ?: return
@@ -355,7 +398,7 @@ class SoundEngine {
 
     /** 暂停播放并清空缓冲（切后台调用）。保留 track 实例，回前台无需重建。 */
     fun stop() {
-        generation++          // 让音频线程放弃当前音效
+        generation.incrementAndGet()   // 让音频线程放弃当前音效
         synchronized(lock) {
             try {
                 track?.let { t ->
@@ -367,27 +410,39 @@ class SoundEngine {
     }
 
     /**
-     * 回到前台：清除失败冷却。
+     * 回到前台：只重置「已经失败过」的状态，正常路径不改任何东西。
      *
-     * 后台期间系统可能回收掉我们的 track，或曾经因资源紧张失败过；
-     * 不清冷却的话，回前台后的前几声还会继续用提示音。
+     * 这**不是**定时重试：锁定 [Path.TRACK] 且兜底正常时，这里只做两次 boolean 判断。
+     * 它覆盖两个窄场景——冷启动那一瞬音频服务未就绪（三次探测撞在同一毫秒内），
+     * 以及后台期间系统回收资源。用户切走再回来时服务通常已恢复，给一次机会比整局
+     * 都是嘟嘟声合理；若仍然失败，很快又会封存回去（各多一条日志，不是每声一条）。
      */
     fun onForeground() {
-        nextCreateAllowedMs = 0
+        synchronized(lock) {
+            if (released) return
+            // 兜底路径曾创建失败：新会话给一次机会（再失败也只会多一条日志，不是每声）
+            if (toneFailed) {
+                toneFailed = false
+                Log.i(TAG, "回前台：重置提示音兜底")
+            }
+            // 已封存为提示音：重新探测一次合成音
+            if (path == Path.FALLBACK) {
+                createFailures = 0
+                path = Path.UNKNOWN
+                Log.i(TAG, "回前台：重新探测一次音频路径")
+            }
+        }
     }
 
     /** 彻底释放（视图销毁时调用，不要绑在 surface 上） */
     fun release() {
         if (released) return
         released = true
-        generation++
-        // 先暂停并清空：正在轮询写入的音频线程才能尽快退出
-        try {
-            track?.let { t ->
-                if (t.playState == AudioTrack.PLAYSTATE_PLAYING) t.pause()
-                t.flush()
-            }
-        } catch (_: Exception) {}
+        generation.incrementAndGet()
+        // 顺序很重要：先让音频线程自己退出（它每 4ms 检查一次 released），再动 track。
+        // 旧实现是「先 pause+flush 再 await」，那时音频线程可能正卡在 write() 里，
+        // pause/flush 与它并发操作同一段缓冲——虽然 AudioTrack 本身线程安全，
+        // 但这是没必要的竞争，也是上一版 track 泄漏的同类隐患。
         executor.shutdown()
         try {
             if (!executor.awaitTermination(RELEASE_WAIT_MS, TimeUnit.MILLISECONDS)) {
@@ -399,7 +454,13 @@ class SoundEngine {
         synchronized(lock) {
             val t = track
             track = null
-            try { t?.release() } catch (_: Exception) {}
+            try {
+                t?.let {
+                    if (it.playState == AudioTrack.PLAYSTATE_PLAYING) it.pause()
+                    it.flush()
+                    it.release()
+                }
+            } catch (_: Exception) {}
             try { toneGenerator?.release() } catch (_: Exception) {}
             toneGenerator = null
         }

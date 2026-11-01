@@ -585,7 +585,12 @@ class GameSurfaceView(context: Context) : SurfaceView(context), SurfaceHolder.Ca
         initAudio()
     }
 
-    /** 初始化音效/振动（surface 重建后也会重新调用） */
+    /**
+     * 初始化音效/振动（幂等：已存在则复用）。
+     *
+     * 音频引擎在 onDetachedFromWindow 释放、在 init/onAttachedToWindow/surfaceCreated 补建；
+     * 真正决定何时创建 AudioTrack 的是 SoundEngine 内部的首次播放，这里只保证对象存在。
+     */
     private fun initAudio() {
         try {
             if (soundEngine == null) soundEngine = SoundEngine()
@@ -704,6 +709,7 @@ class GameSurfaceView(context: Context) : SurfaceView(context), SurfaceHolder.Ca
         screenHeight = height
         recalcSizes()
         initAudio()
+        soundEngine?.onForeground()   // 回前台清除失败冷却：后台可能已被系统回收 track
         startRendering()    // 重新进入应用时启动 vsync 渲染（首帧由 Choreographer 触发，避免静态界面黑屏）
     }
 
@@ -716,9 +722,24 @@ class GameSurfaceView(context: Context) : SurfaceView(context), SurfaceHolder.Ca
 
     override fun surfaceDestroyed(holder: SurfaceHolder) {
         stopRendering()
+        // 只暂停+清缓冲，不 release：切前后台会走 surfaceDestroyed/surfaceCreated，
+        // 旧实现每次都重建 AudioTrack，与阻塞中的 write 竞态会泄漏 AudioFlinger 侧的 track，
+        // 逐次累积耗尽每 uid 的 track 配额后，新建一律失败 → 从此永久降级为嘟嘟声。
         soundEngine?.stop()
+    }
+
+    override fun onAttachedToWindow() {
+        super.onAttachedToWindow()
+        // 视图重新挂载（如被移除后复用）：音效引擎在 onDetachedFromWindow 已释放，这里补建
+        initAudio()
+    }
+
+    override fun onDetachedFromWindow() {
+        super.onDetachedFromWindow()
+        // 音频生命周期跟着 View 走（Activity 销毁才算真正结束），与 Surface 无关
         soundEngine?.release()
         soundEngine = null
+        vibrator = null
     }
 
     fun startRendering() {

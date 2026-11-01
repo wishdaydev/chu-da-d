@@ -1,5 +1,8 @@
 package com.chudad.game.logic
 
+import com.chudad.game.model.Card
+import com.chudad.game.model.Suit
+
 /**
  * 锄大D 结算牌分计算。
  *
@@ -14,6 +17,11 @@ package com.chudad.game.logic
  */
 object ScoreCalculator {
 
+    /** 牌面 rank：2 记为 15（最大），与 [Card] 的编码一致 */
+    private const val RANK_TWO = 15
+    /** 触发翻倍的最少剩余张数 */
+    private const val DOUBLE_MIN_CARDS = 8
+
     /** 基础牌分（未含黑桃 2 翻倍） */
     fun baseScore(remaining: Int): Int = when {
         remaining <= 0 -> 0
@@ -23,6 +31,14 @@ object ScoreCalculator {
         else -> remaining * 4          // n == 13
     }
 
+    /** 是否触发 ♠2 翻倍：剩余 ≥ 8 张且手中仍有 ♠2（结算与 UI 标注共用同一口径） */
+    fun isDoubled(remaining: Int, hasSpadeTwo: Boolean): Boolean =
+        remaining >= DOUBLE_MIN_CARDS && hasSpadeTwo
+
+    /** 同上，直接用剩余手牌判断（UI 顶部牌带标注用，避免各处重复写 rank/suit 判断） */
+    fun isDoubled(cards: List<Card>): Boolean =
+        isDoubled(cards.size, cards.any { it.rank == RANK_TWO && it.suit == Suit.SPADE })
+
     /**
      * 某玩家最终应扣牌分。
      * @param remaining 剩余手牌数
@@ -30,7 +46,7 @@ object ScoreCalculator {
      */
     fun scoreFor(remaining: Int, hasSpadeTwo: Boolean): Int {
         val base = baseScore(remaining)
-        return if (remaining >= 8 && hasSpadeTwo) base * 2 else base
+        return if (isDoubled(remaining, hasSpadeTwo)) base * 2 else base
     }
 
     /**

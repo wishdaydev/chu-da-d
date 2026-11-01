@@ -426,12 +426,14 @@ class MainActivity : AppCompatActivity(), GameEngineCallback {
             val playerCount = gameEngine.players.size
 
             // 每家剩余张数、是否含黑桃2（阶梯计分 + 黑桃2翻倍）
-            val remaining = IntArray(playerCount) { gameEngine.getCardCount(it) }
+            // 张数直接取真实手牌：结算阶段手牌本就在顶部/底部公开，且这样与「牌带里画了几张」
+            // 天然同源，不会出现展示 9 张却按 10 张扣分的错位
+            val remaining = IntArray(playerCount) { i -> gameEngine.players[i].handCards.size }
             val hasSpadeTwo = BooleanArray(playerCount) { i ->
                 gameEngine.players[i].handCards.any { it.rank == 15 && it.suit == Suit.SPADE }
             }
-            val cardScores = IntArray(playerCount) { i ->
-                ScoreCalculator.scoreFor(remaining[i], hasSpadeTwo[i])
+            val doubled = BooleanArray(playerCount) { i ->
+                ScoreCalculator.isDoubled(remaining[i], hasSpadeTwo[i])
             }
 
             // 顶大失职：仅当报单者（失职者的下家）最终获胜时生效
@@ -443,13 +445,16 @@ class MainActivity : AppCompatActivity(), GameEngineCallback {
             // 四家得分变化（零和）：赢家收三家牌分；顶大失职者独自包赔三家
             val scoreDelta = ScoreCalculator.settle(remaining, hasSpadeTwo, winnerIndex, fail)[0]
 
-            val anyDouble = (0 until playerCount).any {
-                cardScores[it] > ScoreCalculator.baseScore(remaining[it])
-            }
+            // 结算标签只讲「你自己」的结果：别人的 ♠2 翻倍与你这一行的扣分无关，
+            // 旧文案「♠2 翻倍」没有主语，手里没有 ♠2 时会被误读成「我被翻了 2 倍」。
+            val humanDoubled = doubled[0]
+            val othersDoubled = (1 until playerCount).count { doubled[it] }
             val tag = when {
                 penalized == 0 -> "顶大失职·包赔"
                 penalized > 0 -> "顶大失职·代付"
-                anyDouble -> "♠2 翻倍"
+                humanDoubled -> "你留 ♠2，扣分×2"
+                // 赢家手里必然是 0 张、不可能翻倍：这里的翻倍来自对手，正好解释「为什么收这么多」
+                isHumanWin && othersDoubled > 0 -> "对手 ♠2 翻倍"
                 else -> "剩 ${if (isHumanWin) (1 until playerCount).sumOf { remaining[it] } else remaining[0]} 张"
             }
 

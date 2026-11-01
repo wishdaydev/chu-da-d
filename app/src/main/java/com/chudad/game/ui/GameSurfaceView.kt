@@ -15,6 +15,7 @@ import android.view.MotionEvent
 import android.view.SurfaceHolder
 import android.view.SurfaceView
 import com.chudad.game.logic.GameEngine
+import com.chudad.game.logic.ScoreCalculator
 import com.chudad.game.model.Card
 import com.chudad.game.model.CardType
 import com.chudad.game.model.Difficulty
@@ -2256,9 +2257,13 @@ class GameSurfaceView(context: Context) : SurfaceView(context), SurfaceHolder.Ca
         val startX = if (leftAlign) bandLeft else bandRight - rowW
 
         textPaint.textSize = 28f * uiScale
-        textPaint.color = Palette.textGreen
+        // 该家剩余牌触发 ♠2 翻倍时，标签加注并转金色：结算横幅只说「你」的结果，
+        // 对手的翻倍影响的是他扣多少/你收多少，标在牌带上玩家一眼能对上人
+        val doubled = ScoreCalculator.isDoubled(cards)
+        textPaint.color = if (doubled) Palette.gold else Palette.textGreen
         textPaint.textAlign = if (leftAlign) Paint.Align.LEFT else Paint.Align.RIGHT
-        canvas.drawText(label, if (leftAlign) bandLeft else bandRight, backY - 10f, textPaint)
+        val labelText = if (doubled) "$label·♠2×2" else label
+        canvas.drawText(labelText, if (leftAlign) bandLeft else bandRight, backY - 10f, textPaint)
         textPaint.textAlign = Paint.Align.CENTER   // 还原默认对齐，避免影响其它绘制
 
         for ((i, card) in cards.withIndex()) {

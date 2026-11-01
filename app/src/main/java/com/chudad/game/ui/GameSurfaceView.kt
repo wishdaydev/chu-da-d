@@ -231,7 +231,7 @@ class GameSurfaceView(context: Context) : SurfaceView(context), SurfaceHolder.Ca
         isAntiAlias = true; textAlign = Paint.Align.CENTER; typeface = Typeface.DEFAULT
         color = Color.parseColor("#E0E0E0"); textSize = 34f
     }
-    /** 同上，但标准加粗（DEFAULT_BOLD，普通填充不加描边）：专用于「总胜率 / 总积分」两行，与分角色行形成层级区分 */
+    /** 同上，但标准加粗（DEFAULT_BOLD，普通填充不加描边）：专用于「总积分 / 总胜率」两行，与分角色行形成层级区分 */
     private val modeStatBoldPaint = Paint().apply {
         isAntiAlias = true; textAlign = Paint.Align.CENTER; typeface = Typeface.DEFAULT_BOLD
         color = Color.parseColor("#E0E0E0"); textSize = 34f
@@ -2646,27 +2646,27 @@ class GameSurfaceView(context: Context) : SurfaceView(context), SurfaceHolder.Ca
         val rate = if (stat.games > 0) (stat.wins * 100.0 / stat.games) else 0.0
         val totalRateLine = "总胜率:${stat.wins}/${stat.games} (${"%.0f".format(rate)}%)"
         val scoreLine = "总积分:${stat.score}"
-        // 锄大D 四人各自为战，无分角色统计，难度按钮只保留「模式名 + 总胜率 + 总积分」三行
+        // 锄大D 四人各自为战，无分角色统计，难度按钮只保留「模式名 + 总积分 + 总胜率」三行
 
         // 内部文字行高布局随 uiScale 等比（否则按钮框放大后上下留白失衡、字相对框偏小）。
-        // 行数：模式名 + 总胜率 + 总积分 = 3 行内容（框高不变，块整体垂直居中，留白更宽松）。
+        // 行数：模式名 + 总积分 + 总胜率 = 3 行内容（框高不变，块整体垂直居中，留白更宽松）。
         val nameH = 64f * uiScale
         val statH = 34f * uiScale          // 汇总行字号放大 1.1 倍，行距预留避免与相邻行重叠
         val lineGap = 12f * uiScale
         val totalH = nameH + statH * 2 + lineGap * 2
         val blockTop = y + (h - totalH) / 2f
         val c0 = blockTop + nameH / 2f                                                     // 模式名
-        val c1 = blockTop + nameH + lineGap + statH / 2f                                   // 总胜率
-        val c2 = blockTop + nameH + lineGap + statH + lineGap + statH / 2f                 // 总积分
+        val c1 = blockTop + nameH + lineGap + statH / 2f                                   // 总积分
+        val c2 = blockTop + nameH + lineGap + statH + lineGap + statH / 2f                 // 总胜率
         canvas.drawText(
             if (mode == Difficulty.MASTER) "大师" else "普通",
             x + w / 2f, c0 + nameH * 0.32f, modeNamePaint
         )
-        // 汇总行（总胜率/总积分）用标准加粗画笔（DEFAULT_BOLD，普通填充）+ 放大 1.1 倍突出层级；
+        // 汇总行（总积分/总胜率）用标准加粗画笔（DEFAULT_BOLD，普通填充）+ 放大 1.1 倍突出层级；
         // modeStatBoldPaint 仅用于本函数内两汇总行，临时放大并复位，不影响其它绘制
         modeStatBoldPaint.textSize = 34f * uiScale * 1.1f
-        canvas.drawText(totalRateLine, x + w / 2f, c1 + statH * 0.32f, modeStatBoldPaint)
-        canvas.drawText(scoreLine, x + w / 2f, c2 + statH * 0.32f, modeStatBoldPaint)
+        canvas.drawText(scoreLine, x + w / 2f, c1 + statH * 0.32f, modeStatBoldPaint)
+        canvas.drawText(totalRateLine, x + w / 2f, c2 + statH * 0.32f, modeStatBoldPaint)
         modeStatBoldPaint.textSize = 34f * uiScale   // 复位
     }
 
